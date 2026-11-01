@@ -668,6 +668,59 @@ def asset_validation_tests() -> None:
         "ai: asset name rejects control chars",
         expect("invalid_name", lambda: ai._asset_text("a\x01b", "name", 200, required=True)),
     )
+    check(
+        "ai: asset name length limit",
+        expect("invalid_name", lambda: ai._asset_text("a" * 201, "name", 200, required=True)),
+    )
+    check(
+        "ai: asset config depth limit",
+        expect("invalid_config", lambda: ai._asset_config({"a": {"b": {"c": {"d": {"e": {"f": {"g": {"h": {"i": {}}}}}}}}}})),
+    )
+    check(
+        "ai: asset config size limit",
+        expect("config_too_large", lambda: ai._asset_config({"blob": "x" * 70000})),
+    )
+    check(
+        "ai: asset secret value checks",
+        expect("invalid_secret_value", lambda: ai._asset_secret_value(""))
+        and expect("invalid_secret_value", lambda: ai._asset_secret_value("a\x00b"))
+        and expect("invalid_secret_value", lambda: ai._asset_secret_value("x" * 8193)),
+    )
+    check("ai: asset id type rejected", expect("invalid_asset_id", lambda: ai._asset_id_arg({"asset_id": 5})))
+
+    class BadAuditStore:
+        def add_history(self, *args, **kwargs):
+            raise RuntimeError("audit down")
+
+    class RestoreStore:
+        def __init__(self):
+            self.calls = []
+
+        def update_asset(self, asset_id, patch):
+            self.calls.append((asset_id, patch))
+            return {}
+
+    class BadRestoreStore:
+        def update_asset(self, *args, **kwargs):
+            raise RuntimeError("db down")
+
+    check(
+        "ai: asset audit failure reported",
+        ai.ChatRunner(None, BadAuditStore(), None, {})._asset_audit("asset", "t", "a_1", {}) is not None,
+    )
+    restore_store = RestoreStore()
+    check(
+        "ai: asset rollback restores snapshot",
+        ai.ChatRunner(None, restore_store, None, {})._asset_restore({"id": "a_1", "name": "n", "config": {}})
+        == "restored"
+        and bool(restore_store.calls),
+    )
+    check(
+        "ai: asset rollback failure reported",
+        ai.ChatRunner(None, BadRestoreStore(), None, {})
+        ._asset_restore({"id": "a_1", "name": "n", "config": {}})
+        .startswith("failed:"),
+    )
 
 
 def asset_crud_tests(prefix: str) -> None:
@@ -955,6 +1008,380 @@ def asset_crud_tests(prefix: str) -> None:
             "ai: asset history stores no secret value",
             secret not in json.dumps(probe_history, ensure_ascii=False),
             "secret leaked into history",
+        )
+
+        # ---- extra branch coverage ------------------------------------------------
+        missing = asyncio.run(run_chat('@tool asset_get {"asset_id":"a_missing_probe"}'))
+        check(
+            "ai: asset_get missing rejected",
+            "asset_not_found" in tool_output(missing) and missing["approvals"] == 0,
+            tool_output(missing),
+        )
+
+        no_changes = asyncio.run(run_chat(f'@tool asset_update {{"asset_id":"{dir_id}","name":"{dir_name}"}}'))
+        check(
+            "ai: asset_update no changes rejected",
+            "no_changes" in tool_output(no_changes) and no_changes["approvals"] == 0,
+            tool_output(no_changes),
+        )
+
+        type_change = asyncio.run(run_chat(f'@tool asset_update {{"asset_id":"{dir_id}","type":"SSH"}}'))
+        check(
+            "ai: asset_update type change rejected",
+            "invalid_type" in tool_output(type_change) and type_change["approvals"] == 0,
+            tool_output(type_change),
+        )
+
+        update_secret = asyncio.run(
+            run_chat(f'@tool asset_update {{"asset_id":"{dir_id}","config":{{"token":"x"}}}}')
+        )
+        check(
+            "ai: asset_update rejects config secrets",
+            "secret_in_config" in tool_output(update_secret) and update_secret["approvals"] == 0,
+            tool_output(update_secret),
+        )
+
+        big = asyncio.run(
+            run_chat(
+                f'@tool asset_create {{"type":"Setting","name":"{prefix}-big",'
+                f'"config":{{"blob":"{"x" * 21000}"}}}}'
+            )
+        )
+        big_id = tool_json(big).get("id")
+        ids.add(big_id)
+        big_get = tool_json(asyncio.run(run_chat(f'@tool asset_get {{"asset_id":"{big_id}"}}')))
+        check(
+            "ai: asset_get omits oversized config",
+            big_get.get("configOmitted") is True and "blob" in (big_get.get("configKeys") or []),
+            str(big_get)[:300],
+        )
+
+        extra = asyncio.run(
+            run_chat(
+                f'@tool asset_create {{"type":"SSH","name":"{prefix}-extra",'
+                f'"parent_id":"{dir_id}","config":{{"host":"h"}}}}'
+            )
+        )
+        extra_id = tool_json(extra).get("id")
+        ids.add(extra_id)
+
+        dup_ok = asyncio.run(
+            run_chat(
+                f'@tool asset_create {{"type":"SSH","name":"{prefix}-extra",'
+                f'"parent_id":"{dir_id}","allow_duplicate":true}}'
+            )
+        )
+        dup_ok_id = tool_json(dup_ok).get("id")
+        ids.add(dup_ok_id)
+        check(
+            "ai: asset_create allow_duplicate",
+            bool(dup_ok_id) and dup_ok["approvals"] == 1,
+            tool_output(dup_ok),
+        )
+
+        not_dir = asyncio.run(
+            run_chat(
+                f'@tool asset_create {{"type":"SSH","name":"{prefix}-badparent","parent_id":"{extra_id}"}}'
+            )
+        )
+        check(
+            "ai: asset_create parent must be dir",
+            "parent_not_dir" in tool_output(not_dir) and not_dir["approvals"] == 0,
+            tool_output(not_dir),
+        )
+
+        renamed = asyncio.run(
+            run_chat(f'@tool asset_update {{"asset_id":"{extra_id}","name":"{prefix}-extra2"}}')
+        )
+        check(
+            "ai: asset_update rename applied",
+            tool_json(renamed).get("name") == f"{prefix}-extra2" and renamed["approvals"] == 1,
+            tool_output(renamed),
+        )
+        dup_rename = asyncio.run(
+            run_chat(f'@tool asset_update {{"asset_id":"{extra_id}","name":"{prefix}-extra"}}')
+        )
+        check(
+            "ai: asset_update duplicate rename rejected",
+            "duplicate_name" in tool_output(dup_rename) and dup_rename["approvals"] == 0,
+            tool_output(dup_rename),
+        )
+
+        styled = asyncio.run(
+            run_chat(
+                f'@tool asset_update {{"asset_id":"{extra_id}","alias":"tmp-alias","color":"#00aa00"}}'
+            )
+        )
+        cleared = asyncio.run(
+            run_chat(f'@tool asset_update {{"asset_id":"{extra_id}","alias":"","color":null}}')
+        )
+        after_clear = tool_json(asyncio.run(run_chat(f'@tool asset_get {{"asset_id":"{extra_id}"}}')))
+        check(
+            "ai: asset_update clears alias/color",
+            styled["approvals"] == 1
+            and cleared["approvals"] == 1
+            and after_clear.get("alias") == ""
+            and after_clear.get("color") is None,
+            str(after_clear)[:300],
+        )
+
+        root_move = asyncio.run(run_chat(f'@tool asset_move {{"asset_id":"{extra_id}","parent_id":null}}'))
+        check(
+            "ai: asset_move to root",
+            tool_json(root_move).get("parentId") is None and root_move["approvals"] == 1,
+            tool_output(root_move),
+        )
+        back = asyncio.run(
+            run_chat(f'@tool asset_move {{"asset_id":"{extra_id}","parent_id":"{dir_id}"}}')
+        )
+        check("ai: asset_move back to dir", tool_json(back).get("parentId") == dir_id, tool_output(back))
+        ordered = asyncio.run(
+            run_chat(
+                f'@tool asset_move {{"asset_id":"{extra_id}","parent_id":"{dir_id}",'
+                f'"before_id":"{dup_ok_id}"}}'
+            )
+        )
+        check(
+            "ai: asset_move before_id accepted",
+            tool_json(ordered).get("parentId") == dir_id and ordered["approvals"] == 1,
+            tool_output(ordered),
+        )
+        bad_parent = asyncio.run(
+            run_chat(f'@tool asset_move {{"asset_id":"{extra_id}","parent_id":"a_missing_probe"}}')
+        )
+        check(
+            "ai: asset_move missing parent rejected",
+            "invalid_parent" in tool_output(bad_parent) and bad_parent["approvals"] == 0,
+            tool_output(bad_parent),
+        )
+        not_dir_parent = asyncio.run(
+            run_chat(f'@tool asset_move {{"asset_id":"{dir_id}","parent_id":"{dup_ok_id}"}}')
+        )
+        check(
+            "ai: asset_move parent must be dir",
+            "parent_not_dir" in tool_output(not_dir_parent) and not_dir_parent["approvals"] == 0,
+            tool_output(not_dir_parent),
+        )
+        move_rejected = asyncio.run(
+            run_chat(f'@tool asset_move {{"asset_id":"{extra_id}","parent_id":null}}', approve=False)
+        )
+        check(
+            "ai: asset_move rejected",
+            (move_rejected["toolResults"] or [{}])[0].get("ok") is False
+            and "拒绝" in tool_output(move_rejected),
+            tool_output(move_rejected),
+        )
+
+        secret2 = f"H1K-secret2-{prefix}"
+        nested = asyncio.run(
+            run_chat(
+                f'@tool asset_secret_write {{"asset_id":"{extra_id}",'
+                f'"set":{{"proxy.password":"{secret2}"}}}}'
+            )
+        )
+        check(
+            "ai: asset_secret_write nested path",
+            (tool_json(nested).get("updated") or [{}])[0].get("field") == "proxy.password"
+            and nested["approvals"] == 1,
+            tool_output(nested),
+        )
+        extra_get = tool_json(asyncio.run(run_chat(f'@tool asset_get {{"asset_id":"{extra_id}"}}')))
+        check(
+            "ai: asset_get lists nested secret field",
+            "proxy.password" in (extra_get.get("secretFields") or []),
+            str(extra_get.get("secretFields"))[:200],
+        )
+        default_read = asyncio.run(run_chat(f'@tool asset_secret_read {{"asset_id":"{extra_id}"}}'))
+        default_fields = tool_json(default_read).get("fields") or []
+        check(
+            "ai: asset_secret_read defaults to all fields",
+            any(
+                item.get("field") == "proxy.password" and item.get("value") == secret2
+                for item in default_fields
+            )
+            and default_read["approvals"] == 1,
+            tool_output(default_read),
+        )
+        unset_read = asyncio.run(
+            run_chat(f'@tool asset_secret_read {{"asset_id":"{extra_id}","fields":["privateKey"]}}')
+        )
+        unset_fields = tool_json(unset_read).get("fields") or []
+        check(
+            "ai: asset_secret_read unset field",
+            bool(unset_fields)
+            and unset_fields[0].get("present") is False
+            and "value" not in unset_fields[0],
+            tool_output(unset_read),
+        )
+        cleared_secret = asyncio.run(
+            run_chat(f'@tool asset_secret_write {{"asset_id":"{extra_id}","clear":["proxy.password"]}}')
+        )
+        check(
+            "ai: asset_secret_write clear",
+            tool_json(cleared_secret).get("cleared") == ["proxy.password"]
+            and cleared_secret["approvals"] == 1,
+            tool_output(cleared_secret),
+        )
+        exported_after_clear = asset_export_config(extra_id)
+        check(
+            "ai: asset_secret_write clear removed",
+            not (exported_after_clear.get("proxy") or {}).get("password"),
+            str(exported_after_clear)[:200],
+        )
+
+        conflict = asyncio.run(
+            run_chat(
+                f'@tool asset_secret_write {{"asset_id":"{extra_id}","set":{{"password":"x"}},'
+                f'"clear":["password"]}}'
+            )
+        )
+        check(
+            "ai: asset_secret_write conflict rejected",
+            "invalid_secret_request" in tool_output(conflict) and conflict["approvals"] == 0,
+            tool_output(conflict),
+        )
+        empty_set = asyncio.run(
+            run_chat(f'@tool asset_secret_write {{"asset_id":"{extra_id}","set":{{}}}}')
+        )
+        check(
+            "ai: asset_secret_write empty request rejected",
+            "invalid_secret_request" in tool_output(empty_set) and empty_set["approvals"] == 0,
+            tool_output(empty_set),
+        )
+        blank_value = asyncio.run(
+            run_chat(f'@tool asset_secret_write {{"asset_id":"{extra_id}","set":{{"password":""}}}}')
+        )
+        check(
+            "ai: asset_secret_write blank value rejected",
+            "invalid_secret_value" in tool_output(blank_value) and blank_value["approvals"] == 0,
+            tool_output(blank_value),
+        )
+        nul_value = asyncio.run(
+            run_chat(
+                f'@tool asset_secret_write {{"asset_id":"{extra_id}",'
+                f'"set":{{"password":"a\\u0000b"}}}}'
+            )
+        )
+        check(
+            "ai: asset_secret_write NUL rejected",
+            "invalid_secret_value" in tool_output(nul_value) and nul_value["approvals"] == 0,
+            tool_output(nul_value),
+        )
+        huge_value = asyncio.run(
+            run_chat(
+                f'@tool asset_secret_write {{"asset_id":"{extra_id}",'
+                f'"set":{{"password":"{"x" * 8193}"}}}}'
+            )
+        )
+        check(
+            "ai: asset_secret_write oversized rejected",
+            "invalid_secret_value" in tool_output(huge_value) and huge_value["approvals"] == 0,
+            tool_output(huge_value),
+        )
+
+        bad_fields = asyncio.run(
+            run_chat(f'@tool asset_secret_read {{"asset_id":"{extra_id}","fields":"password"}}')
+        )
+        check(
+            "ai: asset_secret_read fields type rejected",
+            "invalid_secret_request" in tool_output(bad_fields) and bad_fields["approvals"] == 0,
+            tool_output(bad_fields),
+        )
+        many_fields = asyncio.run(
+            run_chat(
+                f'@tool asset_secret_read {{"asset_id":"{extra_id}",'
+                f'"fields":{json.dumps(["password"] * 21)}}}'
+            )
+        )
+        check(
+            "ai: asset_secret_read too many fields rejected",
+            "invalid_secret_request" in tool_output(many_fields) and many_fields["approvals"] == 0,
+            tool_output(many_fields),
+        )
+        no_secret = asyncio.run(run_chat(f'@tool asset_secret_read {{"asset_id":"{dir_id}"}}'))
+        check(
+            "ai: asset_secret_read no secrets rejected",
+            "no_secret_fields" in tool_output(no_secret) and no_secret["approvals"] == 0,
+            tool_output(no_secret),
+        )
+        bad_read_field = asyncio.run(
+            run_chat(f'@tool asset_secret_read {{"asset_id":"{extra_id}","fields":["nope"]}}')
+        )
+        check(
+            "ai: asset_secret_read unknown field rejected",
+            "invalid_secret_field" in tool_output(bad_read_field) and bad_read_field["approvals"] == 0,
+            tool_output(bad_read_field),
+        )
+
+        empty_dir = asyncio.run(run_chat(f'@tool asset_create {{"type":"Dir","name":"{prefix}-empty"}}'))
+        empty_id = tool_json(empty_dir).get("id")
+        del_single = asyncio.run(
+            run_chat(f'@tool asset_delete {{"asset_id":"{empty_id}","confirm":true}}')
+        )
+        check(
+            "ai: asset_delete single empty dir",
+            tool_json(del_single).get("deletedCount") == 1 and del_single["approvals"] == 1,
+            tool_output(del_single),
+        )
+        del_missing = asyncio.run(
+            run_chat('@tool asset_delete {"asset_id":"a_missing_probe","confirm":true}')
+        )
+        check(
+            "ai: asset_delete missing rejected",
+            "asset_not_found" in tool_output(del_missing) and del_missing["approvals"] == 0,
+            tool_output(del_missing),
+        )
+
+        missing_parent = asyncio.run(
+            run_chat(
+                f'@tool asset_create {{"type":"Dir","name":"{prefix}-orphan",'
+                f'"parent_id":"a_missing_probe"}}'
+            )
+        )
+        check(
+            "ai: asset_create missing parent rejected",
+            "invalid_parent" in tool_output(missing_parent) and missing_parent["approvals"] == 0,
+            tool_output(missing_parent),
+        )
+        update_missing = asyncio.run(
+            run_chat('@tool asset_update {"asset_id":"a_missing_probe","alias":"x"}')
+        )
+        check(
+            "ai: asset_update missing rejected",
+            "asset_not_found" in tool_output(update_missing) and update_missing["approvals"] == 0,
+            tool_output(update_missing),
+        )
+        move_self = asyncio.run(
+            run_chat(f'@tool asset_move {{"asset_id":"{dir_id}","parent_id":"{dir_id}"}}')
+        )
+        check(
+            "ai: asset_move to self rejected",
+            "asset_cycle" in tool_output(move_self) and move_self["approvals"] == 0,
+            tool_output(move_self),
+        )
+        read_missing = asyncio.run(run_chat('@tool asset_secret_read {"asset_id":"a_missing_probe"}'))
+        check(
+            "ai: asset_secret_read missing rejected",
+            "asset_not_found" in tool_output(read_missing) and read_missing["approvals"] == 0,
+            tool_output(read_missing),
+        )
+        write_missing = asyncio.run(
+            run_chat('@tool asset_secret_write {"asset_id":"a_missing_probe","set":{"password":"x"}}')
+        )
+        check(
+            "ai: asset_secret_write missing rejected",
+            "asset_not_found" in tool_output(write_missing) and write_missing["approvals"] == 0,
+            tool_output(write_missing),
+        )
+
+        history2 = (data_of(req("/api/history?limit=100", method="GET")) or {}).get("history") or []
+        secret_history = [row for row in history2 if row.get("kind") == "asset-secret-read"]
+        check("ai: asset secret history recorded", bool(secret_history), str(secret_history)[:300])
+        check(
+            "ai: asset secret history has no values",
+            secret not in json.dumps(secret_history, ensure_ascii=False)
+            and secret2 not in json.dumps(secret_history, ensure_ascii=False),
+            "secret leaked into secret history",
         )
 
         terminal = asyncio.run(

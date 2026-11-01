@@ -2462,7 +2462,7 @@ grep -c "async def tool_" backend/ai.py                                         
 | 文件 | 变更 |
 |---|---|
 | `backend/ai.py` | `TOOLS` 26 → 33（+7 个 `asset_*`）；新增 `AssetArgError` 与校验/路径/摘要/审计 helper；`ChatRunner` 新增 7 个 handler、`_asset_audit`、`_asset_restore`；`SYSTEM_PROMPT` 增加资产 CRUD 与密钥明文读写说明 |
-| `scripts/test_ai.py` | `TOOLS` 断言 26 → 33；新增 `asset_validation_tests()`（7 条进程内）与 `asset_crud_tests(prefix)`（38 条 mock 端到端）；主流程插入两组用例 |
+| `scripts/test_ai.py` | `TOOLS` 断言 26 → 33；新增 `asset_validation_tests()`（15 条进程内）与 `asset_crud_tests(prefix)`（79 条 mock 端到端）；主流程插入两组用例 |
 | `README.md` | 目录树/工具表 26 → 33；§5.5 补资产 CRUD 审批矩阵、密钥明文策略、删除与审计说明 |
 | `docs/feature-matrix.csv` | 工具计数改 33；新增“工具-资产 CRUD”“工具-资产密钥”两行；审批策略行补 6 个 kind |
 | `docs/completion-audit.csv` | 行 76 改 33 并补资产工具；行 77 补资产审批 |
@@ -2517,20 +2517,25 @@ grep -c "async def tool_" backend/ai.py                                         
 
 ```
 cd replica
-python3 scripts/test_ai.py --base http://127.0.0.1:38110 2>&1 | tee /tmp/h1khub-test_ai.log
-# PASS=118 FAIL=0（其中新增资产相关断言 46 条：7 条进程内 + 39 条端到端）
+python3 scripts/test_ai.py --base http://127.0.0.1:38110 2>&1 | tee /tmp/h1khub-smoke-ai.log
+# PASS=166 FAIL=0（其中资产相关断言 94 条：15 条进程内 + 79 条端到端）
 ```
 
 覆盖（全部本地 mock LLM，无真实 SSH/DB/Docker/外网）：
 
-- 进程内（7）：类型名/id 映射、非法类型、密钥点路径白名单、嵌套密钥路径、config
-  拒绝密钥、颜色校验、名称控制字符。
-- 端到端（39）：create 批准/拒绝/非法类型/config 含密钥/同父重名；get 无审批/子节点/
-  秘密字段名；secret_write 批准/拒绝/未知字段/落库验证（`/api/assets-export`）/审批与
-  事件明文；secret_read 明文/拒绝；update 批准/拒绝/父目录拒绝/字段生效；move 批准/
-  成环拒绝；delete 非空拒绝/未确认拒绝/拒绝执行/批准（3 个资产）/审批详情数量与名称/
-  树已删除；history 记录且不含密钥值；`GET /api/assets` 不含密钥；Terminal 子集不可见
-  资产工具；`finally` 两次按前缀清理并断言无残留。
+- 进程内（15）：类型名/id 映射与非法类型、密钥点路径白名单/嵌套路径、config 拒绝
+  密钥、config 深度/大小上限、颜色、名称控制字符/长度、密钥值空/NUL/超长、asset_id
+  类型、审计写入失败、回滚成功与回滚失败。
+- 端到端（79）：create 批准/拒绝/非法类型/config 含密钥/同父重名/`allow_duplicate`/
+  父不存在/父不是目录；get 无审批/子节点/秘密字段名/超大配置省略/不存在；secret_write
+  批准/拒绝/未知字段/嵌套路径/清除/冲突/空请求/空值/NUL/超长/不存在/落库验证
+  （`/api/assets-export`）/审批与事件明文；secret_read 明文/拒绝/默认全字段/未设置
+  字段/无密钥/非法字段/fields 类型/超 20 字段/不存在；update 批准/拒绝/父目录拒绝/
+  类型拒绝/无变更/改名/重名/别名颜色清空/字段生效/不存在；move 批准/拒绝/成环/自身/
+  父不存在/父不是目录/根目录/`before_id`；delete 非空/未确认/拒绝/单资产/递归（3 个
+  资产）/不存在/审批详情数量与名称/树已删除；history 记录（含 `asset-secret-read`）
+  且不含密钥值；`GET /api/assets` 不含密钥；Terminal 子集不可见资产工具；`finally`
+  两次按前缀清理并断言无残留。
 - 回归：流式对话、shell 审批/拒绝、FTP 全写操作、Docker 动作、SCP、隧道、SQL/Terminal
   模式全部保持 PASS。
 
@@ -2562,3 +2567,28 @@ grep -c "async def tool_" backend/ai.py                                         
   可能因模型回显而保留明文。审计（history）仅记元信息。
 - 列表嵌套的密钥（如 `items[0].password`）不可通过点路径工具寻址/写入。
 - 删除不可撤销；`asset_delete` 单次最多影响 5000 个资产，超出直接拒绝。
+
+### 37.8 冒烟覆盖矩阵（2026-11-01 复测）
+
+命令：`python3 scripts/test_ai.py --base http://127.0.0.1:38110` → **PASS=166 FAIL=0**
+（日志 `/tmp/h1khub-smoke-ai.log`）。按工具列出的已覆盖分支：
+
+| 工具 | 已覆盖分支 | 未覆盖（原因） |
+|---|---|---|
+| `asset_get` | 成功、无审批、子节点、密钥字段名、超大配置 `configOmitted`、不存在、参数类型（进程内） | 配置 >20 KB 之外的分页/裁剪（当前设计是整体省略） |
+| `asset_create` | 批准、拒绝、非法类型、config 含密钥、同父重名、`allow_duplicate`、父不存在、父不是目录、根/子目录 | store 写失败（需故障注入；生产路径为单条 INSERT） |
+| `asset_update` | 批准、拒绝、父目录拒绝、类型拒绝、无变更、改名、改名重名、别名/颜色清空、config 合并、config 含密钥拒绝、不存在、回滚成功/失败（进程内） | 真实 SQLite 写失败（单条 UPDATE，事务内） |
+| `asset_move` | 批准、拒绝、成环、自身、父不存在、父不是目录、根目录、`before_id` | `before_id` 跨父目录的排序细节（store 既有行为） |
+| `asset_delete` | 批准（单资产/递归 3 资产）、拒绝、非空未递归、未确认、不存在、审批详情数量/名称、树已删除 | 5000 个后代的上限（需构造超大树，成本高）；并发删除竞态 |
+| `asset_secret_read` | 批准、拒绝、明文值+长度、默认全部字段、未设置字段 `present=false`、无密钥、非法字段、`fields` 类型错误、>20 字段、不存在 | >32 KB 单值截断（写入上限 8 KB，正常路径不可达） |
+| `asset_secret_write` | 批准、拒绝、明文、嵌套路径、清除、set/clear 冲突、空请求、空值、NUL、超长、未知字段、不存在、落库验证、审计 | 真实存储层异常（同 update，内存回滚有独立进程内用例） |
+
+残余且不打算用 E2E 覆盖的分支：
+
+- 审计/存储故障注入：已用进程内桩覆盖 `_asset_audit` 与 `_asset_restore` 的失败返回值；
+  完整 handler 级故障注入需 monkeypatch store，收益低。
+- 审批“本会话记住”：框架既有行为，资产 kind 未单独复测；`asset_delete` 在审批详情里
+  有显式提示。
+- 并发：本地单用户 SQLite，get→update 之间无全局锁；未做并发压测。
+- 全仓 `scripts/run_all_tests.sh` 需要真实 MySQL/PostgreSQL/Redis/Docker 等外部服务，
+  不属于本轮冒烟范围；本轮只跑 AI 套件及其回归。
