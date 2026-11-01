@@ -475,6 +475,20 @@ def websearch_stub_tests() -> None:
 
             reset()
             ok, out, approvals = await case(
+                {"enabled": True, "endpoint": base + "/ok", "requireApproval": False},
+                {"query": "no approval"},
+            )
+            check(
+                "ai: websearch can skip approval when configured",
+                ok is True
+                and out.get("count", 0) >= 1
+                and approvals == []
+                and hits["count"] == 1,
+                str(out)[:300],
+            )
+
+            reset()
+            ok, out, approvals = await case(
                 {"enabled": True, "endpoint": base + "/ok", "maxResults": 8},
                 {
                     "query": "h1k hub",
@@ -844,9 +858,15 @@ def main() -> int:
                         "endpoint": search_url + "?q={query}&format=json",
                         "timeoutSeconds": 5,
                         "maxResults": 3,
+                        "requireApproval": True,
                     }
                 },
                 method="PUT",
+            )
+            check(
+                "ai: websearch approval defaults on",
+                (settings.get("websearch") or {}).get("requireApproval") is True,
+                str(settings.get("websearch"))[:300],
             )
             approved = asyncio.run(run_chat('@tool websearch {"query":"h1khub e2e","max_results":3}'))
             approved_result = (approved["toolResults"] or [{}])[0]
@@ -892,6 +912,18 @@ def main() -> int:
                 and invalid["approvals"] == 0
                 and search_hits["count"] == before_bad,
                 str(invalid_result)[:300],
+            )
+
+            req("/api/settings", {"websearch": {"requireApproval": False}}, method="PUT")
+            before_auto = search_hits["count"]
+            auto = asyncio.run(run_chat('@tool websearch {"query":"h1khub auto","max_results":2}'))
+            auto_result = (auto["toolResults"] or [{}])[0]
+            check(
+                "ai: websearch approval switch off skips prompt",
+                auto_result.get("ok") is True
+                and auto["approvals"] == 0
+                and search_hits["count"] == before_auto + 1,
+                str(auto_result)[:300],
             )
         finally:
             req("/api/settings", {"websearch": ORIGINAL_WEBSEARCH}, method="PUT")

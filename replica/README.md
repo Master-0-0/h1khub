@@ -394,25 +394,27 @@ WebSocket 帧为 JSON：
 }
 ```
 
-- 只读操作直接执行；写文件、shell、写 SQL、写 Redis 命令、Docker 容器启停/重启、FTP 上传/下载/删除/重命名、联网搜索会阻塞并弹出审批卡片（Docker、FTP 写操作与联网搜索使用独立审批 kind，不受静默策略影响）。
+- 只读操作直接执行；写文件、shell、写 SQL、写 Redis 命令、Docker 容器启停/重启、FTP 上传/下载/删除/重命名、联网搜索默认会阻塞并弹出审批卡片（Docker、FTP 写操作与联网搜索使用独立审批 kind，不受静默策略影响；联网搜索可在设置中关闭审批）。
 - 危险命令（`rm`、`dd`、`mkfs`、`shutdown`、`sudo` 包装、管道执行等）即使开启"静默命令"也必须审批。
 - 审批结果可按"本会话记住"缓存；拒绝则工具返回"用户拒绝"。
 - 工具输出截断到 100 KB，避免把超大结果塞回模型。
 
 联网搜索（`websearch`）默认关闭，**没有默认端点**；`settings.websearch.enabled=false` 或
 `endpoint` 为空时，工具只返回结构化错误（`websearch_disabled` / `websearch_not_configured`，
-语义 501），不会发起任何 DNS/HTTP 请求。可在「设置 → Agent → 联网搜索」启用并填写端点，
+语义 501），不会发起任何 DNS/HTTP 请求。可在「设置 → Agent → 联网搜索」启用、选择是否每次审批并填写端点，
 或调用本机 API：
 
 ```http
 PUT /api/settings
-{"websearch": {"enabled": true, "endpoint": "https://searx.example/search?q={query}&format=json", "timeoutSeconds": 15, "maxResults": 8}}
+{"websearch": {"enabled": true, "endpoint": "https://searx.example/search?q={query}&format=json", "timeoutSeconds": 15, "maxResults": 8, "requireApproval": true}}
 ```
 
 端点约定：GET，返回 `{"results":[{"title","url","snippet"}]}`（也接受裸数组 / `items` / `data`）；
 `{query}` 做 URL 编码替换，未包含占位符时自动追加 `q=`。单次响应最多读取 1 MB，默认 15 s 超时
 （1–30 s），标题/摘要分别截断到 300/1000 字符；`allowed_domains` / `blocked_domains` 可按域名过滤。
-联网搜索使用独立审批 kind `websearch`，不继承静默策略；**不内置 DuckDuckGo 或 `api.hexhub.cn` 回退**
+联网搜索默认每次调用都走独立审批 kind `websearch`，不继承静默策略；`requireApproval=false`
+可在设置中关闭审批，关闭后不再弹出审批卡片（仍需端点已配置，并继续受超时/大小/域名过滤约束）。
+**不内置 DuckDuckGo 或 `api.hexhub.cn` 回退**
 （原版 `NewWebSearchTool` 抓 DuckDuckGo HTML，默认云地址仅作为逆向资料记录）。该工具不纳入
 Terminal / SQL 助手子集。
 

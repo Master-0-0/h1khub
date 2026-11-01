@@ -285,7 +285,8 @@ function initEmptyDraft() {
   const settings = clone(state.settings)
   Object.assign(draft, settings)
   if (!Array.isArray(draft.ai?.providers)) draft.ai = { ...(draft.ai || {}), providers: [] }
-  if (!draft.websearch) draft.websearch = { enabled: false, endpoint: '', timeoutSeconds: 15, maxResults: 8 }
+  if (!draft.websearch) draft.websearch = { enabled: false, endpoint: '', timeoutSeconds: 15, maxResults: 8, requireApproval: true }
+  if (draft.websearch.requireApproval === undefined) draft.websearch.requireApproval = true
 }
 initEmptyDraft()
 
@@ -315,7 +316,8 @@ function resetDraft() {
   Object.keys(draft).forEach((k) => delete draft[k])
   Object.assign(draft, settings)
   if (!Array.isArray(draft.ai?.providers)) draft.ai = { ...(draft.ai || {}), providers: [] }
-  if (!draft.websearch) draft.websearch = { enabled: false, endpoint: '', timeoutSeconds: 15, maxResults: 8 }
+  if (!draft.websearch) draft.websearch = { enabled: false, endpoint: '', timeoutSeconds: 15, maxResults: 8, requireApproval: true }
+  if (draft.websearch.requireApproval === undefined) draft.websearch.requireApproval = true
 }
 
 watch(
@@ -721,8 +723,12 @@ function setActiveProvider(id) {
             <h3 style="margin-top: 18px">{{ t('联网搜索（websearch）', 'Web search (websearch)') }}</h3>
             <div class="alert info">{{ t('默认关闭且没有默认端点：关闭或端点为空时，Agent 不会发起任何 DNS/HTTP 请求，只返回结构化错误。复刻版不内置 DuckDuckGo 或 api.hexhub.cn 回退。', 'Off by default with no default endpoint: while disabled or unconfigured the agent makes no DNS/HTTP request and only returns a structured error. This build has no DuckDuckGo or api.hexhub.cn fallback.') }}</div>
             <div class="settings-row">
-              <div><div class="label">{{ t('启用联网搜索', 'Enable web search') }}</div><div class="desc">{{ t('每次调用仍需审批', 'Each call still requires approval') }}</div></div>
+              <div><div class="label">{{ t('启用联网搜索', 'Enable web search') }}</div><div class="desc">{{ t('默认关闭；需先配置端点', 'Off by default; configure an endpoint first') }}</div></div>
               <div class="control"><span class="switch" :class="{ on: draft.websearch.enabled }" @click="draft.websearch.enabled = !draft.websearch.enabled" /></div>
+            </div>
+            <div class="settings-row">
+              <div><div class="label">{{ t('每次调用仍需审批', 'Require approval for each call') }}</div><div class="desc">{{ t('默认开启；关闭后直接发起搜索（仍需先配置端点）', 'On by default; when off, searches run without an approval prompt (endpoint still required)') }}</div></div>
+              <div class="control"><span class="switch" :class="{ on: draft.websearch.requireApproval }" @click="draft.websearch.requireApproval = !draft.websearch.requireApproval" /></div>
             </div>
             <div class="field">
               <label>{{ t('搜索端点（JSON）', 'Search endpoint (JSON)') }}</label>

@@ -30,7 +30,7 @@ SYSTEM_PROMPT = """你是 H1KHub（数据库 / SSH / SFTP / Docker 一体化桌�
 - 执行 Redis 命令、查看 Docker 容器与日志、启动/停止/重启 Docker 容器
 - 浏览 FTP 目录，上传/下载/删除/重命名 FTP 文件
 - 读取当前打开终端的内容
-- 联网搜索网页（websearch；必须由用户显式配置端点，默认关闭，每次调用都需要审批）
+- 联网搜索网页（websearch；必须由用户显式配置端点，默认关闭，默认每次调用都需要审批，可在设置中关闭）
 
 行为准则：
 1. 先用工具确认事实，再下结论；不要编造文件内容、命令输出或查询结果。
@@ -260,7 +260,7 @@ TOOLS: list[dict] = [
     ),
     _tool(
         "websearch",
-        "联网搜索网页，返回结果标题、链接与摘要（需要用户审批）。默认关闭且没有默认端点；"
+        "联网搜索网页，返回结果标题、链接与摘要（默认需要用户审批）。默认关闭且没有默认端点；"
         "未配置时返回 websearch_not_configured，不会发起任何网络请求。",
         {
             "query": {"type": "string", "description": "搜索关键词"},
@@ -802,9 +802,9 @@ class ChatRunner:
         if kind == "ftp_write":
             return False
         if kind == "websearch":
-            # 联网搜索始终需要审批：即使开启了“静默命令”，也不能让模型在
-            # 未经确认的情况下把关键字发给外部端点。
-            return False
+            # 默认每次调用都审批；用户可在 settings.websearch.requireApproval
+            # 显式关闭。关闭后仍需端点已配置，并继续受域名过滤/超时/结果截断约束。
+            return not bool(self._websearch_config().get("requireApproval", True))
         return False
 
     async def _require(self, kind: str, title: str, detail: dict) -> bool:

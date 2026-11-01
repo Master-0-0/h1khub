@@ -103,6 +103,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "endpoint": "",
         "timeoutSeconds": 15,
         "maxResults": 8,
+        # 默认每次调用都要审批；用户可在设置中关闭，关闭后直接搜索。
+        "requireApproval": True,
     },
     "ai": {
         "providers": [],

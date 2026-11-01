@@ -2349,10 +2349,10 @@ grep -c "async def tool_" backend/ai.py                                         
 
 | 文件 | 变更 |
 |---|---|
-| `backend/ai.py` | `TOOLS` 新增 `websearch`；新增 `tool_websearch` 及配置读取/域名过滤/URL 模板/结构化错误辅助方法；`_silent` 声明 `websearch` 恒需审批；系统提示词补充联网搜索边界与“禁止用 shell 绕过” |
-| `backend/store.py` | `DEFAULT_SETTINGS` 新增 `websearch`：`enabled=False`、`endpoint=""`、`timeoutSeconds=15`、`maxResults=8` |
-| `frontend/src/components/SettingsDialog.vue` + `frontend/dist/*` | 设置 → Agent 增加“联网搜索”配置（启用、端点、超时、最多结果），保存走既有 `PUT /api/settings` |
-| `scripts/test_ai.py` | `TOOLS=26 & handlers` 断言；14 条进程内桩用例 + 6 条 mock LLM 端到端用例；本地搜索桩命中计数用于证明“未配置零请求” |
+| `backend/ai.py` | `TOOLS` 新增 `websearch`；新增 `tool_websearch` 及配置读取/域名过滤/URL 模板/结构化错误辅助方法；`_silent` 对 `websearch` 默认要求审批、`requireApproval=false` 时静默；系统提示词补充联网搜索边界与“禁止用 shell 绕过” |
+| `backend/store.py` | `DEFAULT_SETTINGS` 新增 `websearch`：`enabled=False`、`endpoint=""`、`timeoutSeconds=15`、`maxResults=8`、`requireApproval=True` |
+| `frontend/src/components/SettingsDialog.vue` + `frontend/dist/*` | 设置 → Agent 增加“联网搜索”配置（启用、每次调用仍需审批、端点、超时、最多结果），保存走既有 `PUT /api/settings` |
+| `scripts/test_ai.py` | `TOOLS=26 & handlers` 断言；15 条进程内桩用例 + 8 条 mock LLM 端到端用例；本地搜索桩命中计数用于证明“未配置零请求” |
 | `README.md` / `docs/feature-matrix.csv` / `docs/completion-audit.csv` | 计数 25 → 26、工具枚举、审批说明、降级策略 |
 
 工具总数 **25 → 26**（`len(TOOLS)` 为唯一依据）。
@@ -2369,9 +2369,11 @@ grep -c "async def tool_" backend/ai.py                                         
 3. **禁止默认云地址**：没有任何回退端点；`api.hexhub.cn` 与 DuckDuckGo 只出现在本文档的
    历史说明中。端点必须由用户显式配置为 `http(s)` URL。
 4. **总开关**：`enabled` 即总开关；关闭后同样零请求。
-5. **独立审批**：审批 kind 为 `websearch`，`_silent` 恒返回 `False`，不复用 `shell` /
-   `write_file`；审批卡片只展示查询词、端点主机名、结果条数与域名过滤，不展示完整
-   endpoint 路径（避免把 URL 中的参数带回模型）。批准后仍受“本会话记住”框架约束。
+5. **审批（默认开启、可关闭）**：审批 kind 为 `websearch`，不复用 `shell` / `write_file`；
+   `settings.websearch.requireApproval` 默认 `True`，每次调用都弹审批卡片；显式设为
+   `False` 后 `_silent("websearch")` 返回 `True`，不再弹卡片（仍要求端点已配置，并继续受
+   超时/大小/域名过滤约束）。审批卡片只展示查询词、端点主机名、结果条数与域名过滤，
+   不展示完整 endpoint 路径（避免把 URL 中的参数带回模型）。开启审批时仍受“本会话记住”框架约束。
 6. **网络边界**：默认 15 s 总超时（设置范围 1–30 s），响应最多读取 1 MB，超过返回
    `websearch_response_too_large`；标题/摘要用 `clamp_text` 截断到 300/1000 字符；
    最多返回 10 条；`allowed_domains` / `blocked_domains` 在解析后按主机名后缀过滤。
@@ -2393,8 +2395,9 @@ grep -c "async def tool_" backend/ai.py                                         
 | 端点非 http(s) | 不弹审批 | `websearch_endpoint_invalid`（400），零请求 |
 | 查询为空/含控制字符/超长 | 不弹审批 | `invalid_query`（400） |
 | 域名列表非法 | 不弹审批 | `invalid_domains`（400） |
-| 用户拒绝 | `websearch` 审批一次 | “用户拒绝联网搜索”，零请求 |
-| 批准 | `websearch` 审批一次 | 请求端点；超时/HTTP/坏 JSON 分别为 `websearch_timeout`（504）/`websearch_http_error`（502）/`websearch_bad_response`（502） |
+| `requireApproval=false` | 不弹审批 | 直接请求端点（仍受超时/大小/过滤约束） |
+| 用户拒绝（`requireApproval=true`） | `websearch` 审批一次 | “用户拒绝联网搜索”，零请求 |
+| 批准（`requireApproval=true`） | `websearch` 审批一次 | 请求端点；超时/HTTP/坏 JSON 分别为 `websearch_timeout`（504）/`websearch_http_error`（502）/`websearch_bad_response`（502） |
 
 ### 36.4 测试与证据
 
@@ -2403,19 +2406,19 @@ grep -c "async def tool_" backend/ai.py                                         
 ```
 cd replica
 python3 scripts/test_ai.py --base http://127.0.0.1:38110 2>&1 | tee /tmp/h1khub-test_ai.log
-# PASS=68 FAIL=0（基线 48 + 本轮 20）
+# PASS=71 FAIL=0（基线 48 + 本轮 23）
 ```
 
 覆盖（全部本地，无外部模型/网络）：
 
-- 进程内（14 条）：默认关闭、未配置、非 http 端点、空查询、控制字符、非法域名列表、
-  拒绝路径零请求、批准后解析/域名过滤/去重、长摘要截断、`max_results` 截到 10、
-  `{query}` 模板、坏 JSON、HTTP 500、1 s 超时。
-- mock LLM 端到端（6 条）：关闭零请求、未配置零请求、批准后返回本地桩结果、
-  查询确实发送到配置端点、拒绝路径零请求、空查询在审批前失败。
+- 进程内（15 条）：默认关闭、未配置、非 http 端点、空查询、控制字符、非法域名列表、
+  拒绝路径零请求、`requireApproval=false` 跳过审批并成功请求、批准后解析/域名过滤/去重、
+  长摘要截断、`max_results` 截到 10、`{query}` 模板、坏 JSON、HTTP 500、1 s 超时。
+- mock LLM 端到端（8 条）：关闭零请求、未配置零请求、审批默认开启、批准后返回本地桩结果、
+  查询确实发送到配置端点、拒绝路径零请求、空查询在审批前失败、审批关闭后 0 次审批并成功请求。
 - 设置 UI（headless Chromium/CDP，一次性往返检查，未纳入 `test_ai.py`）：
-  「设置 → Agent → 联网搜索」的启用开关、端点、超时、最多结果 4 个控件存在；
-  修改后保存，`GET /api/settings` 回读为 `enabled=true / endpoint=… / timeoutSeconds=7 / maxResults=4`，
+  「设置 → Agent → 联网搜索」的启用开关、审批开关、端点、超时、最多结果 5 个控件存在，
+  审批开关默认 `on`；关闭后保存，`GET /api/settings` 回读 `requireApproval=false`，
   随后经 API 还原默认值。
 - 回归：既有流式对话、shell 审批/拒绝、FTP 全写操作、Docker 动作、SCP、隧道、
   SQL/Terminal 模式保持 PASS。
@@ -2426,7 +2429,7 @@ python3 scripts/test_ai.py --base http://127.0.0.1:38110 2>&1 | tee /tmp/h1khub-
 |---|---|
 | `README.md:187`（目录树） | 26 个工具 |
 | `README.md:317`（AI Agent 能力表） | 26 个（补 websearch） |
-| `README.md:397`（审批说明） | 补联网搜索独立审批、默认关闭、无默认端点与端点契约 |
+| `README.md:397`（审批说明） | 补联网搜索独立审批（默认开启、可关闭）、默认关闭、无默认端点与端点契约 |
 | `docs/feature-matrix.csv:72` | 26 个工具；新增“工具-联网搜索”行 |
 | `docs/completion-audit.csv:77` | AI 工具 26 个 |
 | `docs/verification.md` | 本节（§36） |
