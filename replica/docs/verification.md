@@ -2205,3 +2205,36 @@ README 中引用的 37 张截图已全部用当前构建（H1KHub 品牌）在�
 `scripts/test_chromeproxy_jumps.py`（43）、`scripts/test_archive_ui.py`（38/39），
 以及按同一套 CDP 流程补采的数据库/Redis/Docker/设置/锁屏/AI/Chrome 代理/资产地图详情与拓扑等页面（12/22/27/40-42）。
 仅 `jump-demo-chain.png`、`jump-demo-cycle.png` 两张早期跳板测试图未重采（未被任何文档引用，对应 zz-demo-* 测试资产已清理）。
+
+---
+
+## 34. AI 工具计数纠偏（2026-11-01）
+
+工具计数以 `len(TOOLS)` 为准，实测 20；此前文档 21 为计数笔误。
+
+| 位置 | 原值 | 现值 |
+|---|---|---|
+| `README.md:187`（目录树） | 21 个工具 | 20 个工具 |
+| `README.md:317`（AI Agent 能力表） | 21 个 | 20 个 |
+| `docs/feature-matrix.csv:72` | 21 个工具 | 20 个工具 |
+| `docs/completion-audit.csv:77` | AI 工具 21 个 | AI 工具 20 个 |
+
+代码核对（唯一依据，文档数字必须与之一致）：
+
+```
+python3 -c "import sys;sys.path.insert(0,'backend');import ai;print(len(ai.TOOLS))"   # → 20
+grep -c "async def tool_" backend/ai.py                                              # → 20
+```
+
+`TOOLS` 的 20 个名称与 `tool_*` handler 集合逐一对应，无孤儿工具、无未注册 handler：
+`list_assets`、`list_dir`、`read_file`、`write_file`、`shell`、`list_db_objects`、
+`execute_sql`、`redis_command`、`docker_containers`、`docker_logs`、`list_sessions`、
+`read_terminal`、`terminal_execute`、`scp_upload`、`scp_download`、`list_tunnels`、
+`start_tunnel`、`stop_tunnel`、`ftp_list`、`web_fetch`。
+
+`README.md:317` 的枚举（资产、文件、目录、shell、SQL、Redis、Docker、终端、SCP 上下行、
+隧道启停/列表、FTP 列目录、网页抓取）按类目对应到具体工具合计 20 个：文件 2（读/写）、
+SQL 2（对象清单/执行）、Docker 2（容器/日志）、终端 3（会话/读取/注入）、SCP 2（上/下行）、
+隧道 3（启动/停止/列表），其余 6 类各 1，与代码一致。
+
+回归：`python3 scripts/test_ai.py --base http://127.0.0.1:38110` → **PASS=24 FAIL=0**。

@@ -69,7 +69,7 @@ Docker,本地 OCI registry 发布/拉取,已实现,tools/oci_registry.py（/v2�
 AI,OpenAI 兼容 + Anthropic,已实现,ai.py,AiChat,
 AI,流式对话,已实现,ai.py,AiChat,
 AI,供应商预设 13 家,已实现,ai.py provider_urls,SettingsDialog,13 家 + 自定义；真实 Key 未接入
-AI,工具调用,已实现,ai.py tools,AiChat,21 个工具（含 SCP/隧道/FTP）
+AI,工具调用,已实现,ai.py tools,AiChat,20 个工具（含 SCP/隧道/FTP）
 AI,审批策略,已实现,ai.py / settings,AiChat,可本会话记住
 AI,会话持久化,已实现,store.py chat_*,AiChat,
 AI,模型列表/连通性测试,已实现,app.py /api/ai/*,SettingsDialog,

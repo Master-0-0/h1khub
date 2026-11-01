@@ -184,7 +184,7 @@ python3 scripts/seed_demo.py --reset-settings
 │  ├─ key_svc.py   密钥生成、ssh-copy-id（公钥追加）                              │
 │  ├─ redis_svc.py Redis 键空间、类型化读写、批量操作、控制台、实时信息          │
 │  ├─ docker_svc.py Docker CLI（本地 socket / SSH / TCP）、Compose、容器文件     │
-│  ├─ ai.py        OpenAI 兼容 / Anthropic 流式对话 + 21 个工具 + 审批            │
+│  ├─ ai.py        OpenAI 兼容 / Anthropic 流式对话 + 20 个工具 + 审批            │
 │  └─ app.py       路由、鉴权、RPC、静态资源                                     │
 └───────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -314,7 +314,7 @@ python3 scripts/seed_demo.py --reset-settings
 | 供应商 | ✅ | OpenAI 兼容协议 + Anthropic Messages；内置 13 家预设 + 自定义 |
 | 模型目录 / 连通性测试 | ✅ | `/v1/models` 拉取、最小对话测试 |
 | 流式对话 | ✅ | SSE 解析、增量渲染、停止、token 统计 |
-| 工具 | ✅ | 21 个：资产、文件、目录、shell、SQL、Redis、Docker、终端、SCP 上下行、隧道启停/列表、FTP 列目录、网页抓取 |
+| 工具 | ✅ | 20 个：资产、文件、目录、shell、SQL、Redis、Docker、终端、SCP 上下行、隧道启停/列表、FTP 列目录、网页抓取 |
 | 审批策略 | ✅ | 默认静默读/只读 SQL；写文件、命令、写 SQL 需审批；危险命令始终审批；可"本会话记住" |
 | 会话持久化 | ✅ | SQLite 中的 chat/messages，界面可新建、切换、删除 |
 | 专用助手 | ✅ | 通用 / Terminal 2.0（终端上下文+终端工具）/ SQL（数据库与 SQL 上下文+SQL 工具） |
