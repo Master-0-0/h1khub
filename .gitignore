@@ -1,0 +1,25 @@
+# 本仓库只跟踪复刻代码（replica/）。
+# 顶层其余内容均为逆向原始证据 / 交付文档，不属于 main 分支的源码，故整体排除。
+# 需要纳入时用 `git add -f <path>` 显式放行。
+# 注意：全部使用以 / 开头的锚定模式，否则 `frontend/` 会误伤 replica/frontend/。
+
+# --- 原版二进制与解包产物 ---
+/*.deb
+/extract/
+/frontend/
+/artifacts/
+/shots/
+/hexhub-running.png
+
+# --- 逆向拆解文档（依据，非源码） ---
+/HexHub-5.1.9-REA-逆向拆解.md
+/hexhub-功能矩阵.csv
+/HexHub-功能体验报告.md
+/开源替代调研.md
+/REA-本地部署.md
+/rea-env.sh
+/复刻交付说明.md
+/复刻完成度核查报告.md
+
+# --- 改动前的代码快照备份 ---
+/backup-jumps-*/

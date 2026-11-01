@@ -1,0 +1,19 @@
+syntax = "proto3";
+package proto_model;
+option go_package = ".;proto_model";
+
+message SqlGenReq {
+  string db = 1;
+  string schema = 2;
+  string table = 3;
+  string type = 4;
+  repeated string cols = 5;
+  repeated  SqlGenReqRow rows = 6;
+  repeated string keyCols = 7;
+  repeated  SqlGenReqRow keyRows = 8;
+}
+
+message SqlGenReqRow {
+  repeated bool nulls = 1;
+  repeated string cols = 2;
+}

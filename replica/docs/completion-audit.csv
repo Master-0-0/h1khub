@@ -1,0 +1,100 @@
+﻿序号,功能域,原产品功能,复刻状态,核查说明
+1,架构,CEF 外壳,形态替代,CEF 外壳为浏览器形态替代，无原生桥/托盘
+2,架构,Go 后端,形态替代,后端改为 Python/aiohttp，非 Go
+3,架构,本地 HTTP,已复刻,本地 HTTP + Token 鉴权，已实测 401/公开端点
+4,架构,RPC 通道,已复刻,二进制 Packet（XOR 逐字节、u16/u32/u32 头）+ ChannelOpen/Send/Close；/proto 提供拆解所得 table_data/ssh/sql_gen/executor_data/redis_scan schema；TableDataResponse protobuf 编解码，SQL 查询经 RPC 返回；test_rpc_proto.py 11 项通过（原始 WS 帧 + UI）
+5,架构,IPC,未实现,仅 WebSocket（useIpc=false）
+6,架构,反嵌入,形态替代,无 CEF/window.hexhub，不需要反嵌入
+7,资产,资产树,已复刻,资产树：21 类型/嵌套/搜索(含别名)/颜色/收藏 + 显示别名 + 拖拽排序/移动根目录；别名与排序 API 实测
+8,资产,导入/导出,已复刻,JSON 资产包导入导出
+9,资产,全局搜索,已复刻,Ctrl+K 全局搜索
+10,资产,最近历史,已复刻,最近历史/命令历史
+11,资产,后台任务,已复刻,后台任务：统一任务队列 + 面板；SQL 导入/跨服务器传输/Docker 拉取支持 background，轮询状态、取消、结果展示；已实测
+12,资产,云同步,未实现,无云同步
+13,终端,本地 Shell,已复刻,本地 PTY（Shell/工作目录/环境变量）
+14,终端,SSH 密码/私钥,已复刻,SSH 密码/私钥/口令，已实测
+15,终端,SSH Agent,已复刻,SSH Agent 端到端验证：临时 ssh-agent + authorized_keys，Agent 认证连接与远程命令执行成功；缺失 socket 报错清晰
+16,终端,跳板机,已复刻,跳板机，已实测两级
+17,终端,代理,已复刻,SOCKS5 与 HTTP CONNECT 代理端到端验证（本机代理 fixture）：SSH 握手、命令执行、不可达代理错误路径均通过
+18,终端,主机密钥确认,已复刻,known_hosts TOFU + 变更拒绝
+19,终端,X11 转发,已复刻,paramiko Channel.request_x11 + Xauthority cookie + 本地 X 代理（Xvnc :1）；远程 DISPLAY=localhost:10.0，xdpyinfo 经转发成功；test_x11.py 6 项通过
+20,终端,端口转发/隧道,已复刻,独立 SSHTunnel 资产管理：local/remote/dynamic(SOCKS5) 三种模式，启动/探测/停止已实测，UI 可查看监听地址与连接数；SSH 资产右键「通过服务器代理 Chrome」启动本机 Chrome 并复用 SOCKS5 隧道（test_chromeproxy.py PASS=75；3 跳 SSH 链 + 真实 Chrome 实测 test_chromeproxy_jumps.py PASS=23）
+21,终端,终端增强,已复刻,@xterm/addon-webgl GPU 渲染（失败自动回退 DOM）+ 会话日志 0600 + 断线重连；ui_flow 实测 renderer=webgl
+22,终端,命令广播,已复刻,命令广播：向多个打开会话同时注入命令；WebSocket 端到端验证两台（含跳板）均收到并执行
+23,终端,批量执行,已复刻,多主机批量执行，已实测 2 台
+24,终端,复制公钥/生成私钥,已复刻,密钥管理：生成 ed25519/RSA 私钥+公钥、ssh-copy-id（幂等）；生成→复制→密钥登录已实测
+25,终端,共享密码对,已复刻,SSHPasswordPair 编辑器；SSH 资产通过 passwordPairAssetId 引用并登录成功，已实测
+26,终端,Telnet,已复刻,Telnet IAC 协商 + 会话输入输出端到端验证（本机 telnet fixture）：登录、echo、uname、退出均正常
+27,终端,串口,已复刻,串口终端：pyserial 会话（数据位/校验/停止位/波特率），socat PTY 对端到端双向收发验证；真实串口硬件未插入
+28,终端,RDP,形态替代,原 Linux 版 RDP 本身不支持
+29,终端,VNC,已复刻,VNC：资产字段(主机/端口/密码)、专用视图(地址/复制)、端口探测；与原产品一致不内置 RFB 画面；已实测
+30,文件,SFTP,已复刻,SFTP 浏览/上传/下载/编辑/chmod 已实测；文件面板多选压缩/解压（tar.gz/tar.bz2/tar.xz/tar/zip/7z）在远端 SSH 主机直接调用 tar/zip/7z，本地用标准库，含越界路径拒绝与覆盖/跳过，scripts/test_archive.py PASS=135、test_archive_ui.py PASS=27；超过 2GB 上传会提示无断点续传，下载失败给出重试提示
+31,文件,FTP,已复刻,明文 FTP 客户端：连接/列目录/上传/下载/重命名/删除/在线编辑，端到端实测（本机 FTP fixture）
+32,文件,SCP,已复刻,SCP 上传/下载（远端 scp -t/-f 协议）端到端实测，含缺失文件错误路径
+33,文件,trzsz,已复刻,trzsz 已复刻：backend/trzsz_svc.py 实现隧道 hello 与 base64/zlib 帧协议，经 SSH direct-tcpip 对接远端 trz/tsz；终端工具栏上传/下载入口；scripts/test_trzsz.py PASS=9（真实 SSH 往返字节一致）
+34,文件,ZModem,已复刻,zmodem.js sentry 接管终端：sz 下载自动保存、rz 上传经文件选择回传；test_zmodem.py 6 项通过（真实 lrzsz 往返）
+35,文件,跨服务器传输,已复刻,跨服务器 SFTP→SFTP 文件/目录传输，支持覆盖/跳过；两台 SSH 资产端到端实测
+36,文件,本地文件浏览,已复刻,本地/远程双栏：本地文件浏览、目录收藏、路径同步到远程、独立导航；远程需选 SSH 资产；跨栏直接传输仍用下载/上传
+37,文件,远程编辑,已复刻,SFTP 在线编辑
+38,数据库,MySQL/MariaDB,已复刻,MySQL/MariaDB，已实测
+39,数据库,PostgreSQL/Kingbase,已复刻,PostgreSQL：连接/对象树/查询/事务/结构编辑/导入/导出均实测；nextset 回归用例 count(*)=2 通过
+40,数据库,SQL Server,已复刻,SQLServerAdapter（pymssql）在本机 SQL Server 2019 真实实例实测通过：127.0.0.1:14330（容器 mssql2019，镜像 hexhub-mssql:2019，Microsoft SQL Server 2019 RTM-CU32-GDR 15.0.4500.2，Developer Edition）；连接/版本/库+架构对象树/表数据（users 2 行、orders 2 行，主键 id，5 列元数据）/查询/SHOWPLAN_XML 执行计划/DDL/表元数据/CSV 导出全部实测；探针表 zz_ss_probe CREATE→INSERT→UPDATE→DELETE 每步读回一致并已删除（残留 0）；UI 双击资产可展开 hexhub_demo 树并渲染 users 2 行；scripts/test_sqlserver.py PASS=32 FAIL=0（29 API + 3 UI）。注：2022 镜像在 VMware + 6.19 内核下 PAL 自旋（chroot 直跑同样复现，排除容器配置），已改用 2019 镜像
+41,数据库,Oracle,已复刻,OracleAdapter（python-oracledb thin）对接真实 Oracle 19c SE2 共享实例（ecourse.org:1521/ol8.ecourse.org，服务名 ol8.ecourse.org，用户 SCOTT）：连接/版本（banner_full 实取 19.0.0.0.0）/服务→当前 schema 对象树（SCOTT 82 表 + 2 视图）/EMP 14 行 8 列主键 EMPNO/聚合与 join 查询/DBMS_XPLAN 执行计划/DDL/元数据/索引/ZZ_ORA_PROBE 增改删读回一致并已删除/CSV 导出/UI 树与 14 行表格全部实测通过；scripts/test_oracle.py PASS=50 FAIL=0；v$pdbs、v$session 无权限已按预期回退
+42,数据库,Dameng,已复刻,DamengAdapter（dmPython）对接真实 DM8 实例（Docker 镜像 dm8_20250506_rev270902_x86_rh6_64，127.0.0.1:52360，DM Database Server 64 V8）；连接/版本/用户架构对象树/表数据/查询/EXPLAIN FOR 执行计划/DDL/元数据/增删改读回一致/CSV 导出/UI 树与表格全部实测通过，scripts/test_dameng.py PASS=29 FAIL=0
+43,数据库,ClickHouse,已复刻,ClickHouse 已复刻：ClickHouseAdapter（clickhouse-driver，原生 9000），库/表树、表数据、查询、EXPLAIN、SHOW CREATE TABLE、INSERT 与 ALTER UPDATE/DELETE、realtime/processlist、CSV 导出；真实实例 26.10.3.7；scripts/test_clickhouse.py PASS=24
+44,数据库,SQLite,已复刻,SQLite，已实测
+45,数据库,DuckDB,已复刻,嵌入式 DuckDB adapter：连接/对象树/表数据/查询/Explain/DDL/事务/导出/ATTACH（含 sqlite_scanner 跨库）；DuckDB demo 资产 + 附加库 UI；test_duckdb.py 33 项通过
+46,数据库,MongoDB,已复刻,MongoDB 已复刻：MongoAdapter（pymongo），库/集合树、文档表、shell/JSON 查询、aggregate/count、explain、字段推断、增删改/drop、realtime、CSV；真实实例 7.0.14；scripts/test_mongodb.py PASS=24
+47,数据库,SQL 编辑器,已复刻,SQL 编辑器：关键字补全、格式化、停止执行（MySQL KILL QUERY / PG cancel_backend）、执行耗时；MySQL/PG 长查询取消实测
+48,数据库,表结构设计,已复刻,表结构编辑：字段增改删、类型/默认值/注释、索引、外键；MySQL/PostgreSQL 实测，SQLite 不支持项明确报错
+49,数据库,数据编辑,已复刻,行增改删/NULL、批量删除、批量更新、Blob 文本/十六进制查看与原始下载，均已实测
+50,数据库,导出,已复刻,导出 CSV/JSON/SQL/XLSX/TXT；仍无数据字典与导出模板
+51,数据库,导入,已复刻,.sql 脚本导入：事务包裹/遇错停止/逐语句结果；已实测，XLSX 导入后置
+52,数据库,结构同步,已复刻,结构同步（按表）：字段/类型/默认值/索引/外键差异检测与 ALTER/CREATE 生成；MySQL/PostgreSQL 实测
+53,数据库,数据同步,已复刻,数据同步：同名列 append/replace，行数上限与事务；MySQL/PostgreSQL 实测
+54,数据库,例程/视图,已复刻,视图/例程：定义查看、保存（重建）、删除；MySQL/PostgreSQL 视图与 MySQL 过程端到端实测，UI 右键菜单/编辑器
+55,数据库,实时信息,已复刻,数据库实时信息：MySQL/PG/SQLite 运行指标 + 进程/会话列表，UI 面板已实测
+56,数据库,SSH 隧道/跳板,已复刻,数据库 SSH 隧道
+57,数据库,元数据缓存,已复刻,元数据 20 秒 TTL 缓存 + refresh 强制刷新；结构变更/导入后自动失效
+58,Redis,连接/DB,已复刻,Redis 集群：3 节点集群连接、SCAN、类型读写、批量重命名（跨槽克隆）、批量设置/TTL/删除、INFO/实时信息、db1 拒绝；已实测
+59,Redis,键管理,已复刻,Redis 键管理：SCAN/新增/删除/重命名/TTL + 批量删除/批量重命名/批量设置值/批量设置TTL，已实测
+60,Redis,数据类型,已复刻,h1khub_json 模块（ReJSON-RL 数据类型）：JSON.SET/GET/DEL/TYPE/OBJKEYS/ARRAPPEND/NUMINCRBY/STRLEN/TOGGLE/CLEAR（根路径）；Redis 视图 JSON 编辑器；test_redisjson.py 11 项通过
+61,Redis,控制台,已复刻,Redis 控制台，已实测
+62,Redis,实时信息,已复刻,Redis 实时信息，已实测
+63,Docker,连接,已复刻,Docker 连接：本地 socket、SSH 远程、TCP 远程均实测；无全局代理配置
+64,Docker,容器,已复刻,容器列表/启停/重启/删除/stats + 创建/重命名/pause/unpause/top；临时容器实测后清理
+65,Docker,容器日志/控制台,已复刻,容器日志 + 本地/SSH/TCP 三种容器终端，均已实测
+66,Docker,容器文件,已复刻,容器文件：列目录/读取/写入/上传/下载/重命名/删除；临时容器实测
+67,Docker,镜像,已复刻,Docker 镜像：列表/删除/拉取/推送 + 构建/导出 tar/导入/历史/清理；临时镜像构建与 save/load 已实测
+68,Docker,卷/网络,已复刻,卷/网络列表，已实测
+69,Docker,Compose,已复刻,Compose：读取/写入 compose 文件与 up/down/stop/restart/ps；临时项目端到端实测
+70,Docker,仓库,已复刻,私有仓库登录：本地 Basic-auth /v2/ 端点验证成功与错误密码两条路径；镜像推送未验证（需完整 registry）
+71,Docker,本地网络拉取,已复刻,本地网络拉取已复刻：tools/oci_registry.py 最小 OCI registry + docker save 转 OCI layout；app 本地仓库对话框（启动/发布/拉取）；scripts/test_local_registry.py PASS=10，RepoDigest 与发布 digest 一致，现有容器未动
+72,AI,供应商,已复刻,AI 供应商扩到 13 家预设 + 自定义（OpenAI 兼容 / Anthropic）；设置界面已核验，真实 Key 未接入
+73,AI,通用 Agent,已复刻,通用 Agent：工具卡片、写入前 unified diff 审批预览、文件快照与一键回滚；mock 实测 diff/备份/恢复
+74,AI,Terminal 2.0 助手,已复刻,Terminal 2.0 助手：终端上下文（最近输出/会话列表）+ 终端工具子集；mock 验证工具限制与对话
+75,AI,SQL 编辑器助手,已复刻,SQL 编辑器助手：数据库/SQL 上下文 + SQL 工具子集；mock 验证只读查询执行与审批策略
+76,AI,工具集,已复刻,AI 工具 21 个：新增 SCP 上传/下载、隧道启动/停止/列表、FTP 列目录；mock LLM 端到端实测工具循环与审批
+77,AI,审批策略,已复刻,审批策略/危险命令/本会话记住
+78,AI,模型目录/测试,已复刻,模型目录/连通性测试，已实测 mock
+79,账号,登录/注册,未实现,登录/注册未实现
+80,账号,2FA,未实现,2FA 未实现
+81,账号,资料,未实现,资料修改未实现
+82,账号,会话管理,未实现,在线会话管理未实现
+83,账号,会员/支付,未实现,会员/支付未实现
+84,账号,推广,未实现,推广未实现
+85,账号,云资产,未实现,云资产同步未实现
+86,设置,主题/语言,已复刻,主题：暗/亮/Nord/Dracula/Solarized/GitHub/跟随系统 + 4 强调色；UI 切换与持久化实测
+87,设置,字体/终端/编辑器,已复刻,终端设置（回滚/光标/闪烁/选中复制/右键行为/自动保存会话日志）与编辑器设置（字号/Tab/换行/自动保存）；日志文件 0600 实测，UI 字号/换行实测
+88,设置,快捷键,已复刻,快捷键可配置（搜索/设置/本地终端/关标签/历史/面板），解析 Ctrl/Alt/Shift 组合；改 Ctrl+J 后 UI 实测生效，Nav 1..9 保留
+89,设置,多窗口/分屏,已复刻,垂直/水平分屏 + 同屏打开 + 在新窗口打开（?asset= 独立窗口）+ Ctrl+方向键切面板焦点，最多 4 面板；原版入口取自 index.js 产物（标签菜单「垂直分屏/水平分屏」、basicSplitVertical/Horizontal 快捷键）；scripts/test_split.py PASS=45 FAIL=0；标签拖拽搬迁、会话恢复未做（浏览器形态）
+90,设置,锁屏/托盘,已复刻,锁屏已实现：本地口令门（PBKDF2-HMAC-SHA256 + 随机 salt、失败退避、立即/空闲锁定、服务端锁定状态，刷新/新标签仍锁定）；scripts/test_lock.py PASS=50 FAIL=0；系统托盘仍 unavailable（浏览器形态无托盘），不计入实现
+91,更新,版本检查,已复刻,已实现：GET /api/update/check 读取本机 manifest（file:// 或 127.0.0.1 http(s)）并按数值比较 version/build；只读、不下载、不访问云端、不写资产库；scripts/test_update.py PASS=63 FAIL=0
+92,更新,热更新,未实现,已预留扩展点（docs/reserved-slots.md#92-热更新），未实现
+93,更新,通道,已复刻,已实现：POST /api/update/channel 仅接受 stable/experimental × production/test 并持久化；通道与 env 通过 {channel}/{env} 模板或目录 URL 选择 manifest；非法值 400，不触发下载/重启；scripts/test_update.py PASS=63 FAIL=0
+94,安全,本地加密,改进,改进：AES-256-GCM 全配置加密（替代原硬编码密钥）
+95,安全,云加密,未实现,已预留扩展点（docs/reserved-slots.md#95-云加密），未实现；unavailable：依赖云端会员 RSA 体系
+96,安全,本地 API 鉴权,已复刻,Token 鉴权，已实测 401
+97,安全,遥测,改进,改进：无遥测（原产品每 30 分钟上报）
+98,未知,MCP,未实现,已预留扩展点（docs/reserved-slots.md#98-mcp），未实现（原产品也未发现）
+99,未知,插件市场,未实现,已预留扩展点（docs/reserved-slots.md#99-插件市场），未实现（原产品为编译期内置）

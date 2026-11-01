@@ -1,0 +1,7 @@
+{
+  "version": "5.1.10",
+  "build": 520,
+  "notes": "示例：H1KHub 本地更新 manifest。版本检查只读取本文件，不下载 url、不校验 md5。",
+  "url": "https://example.invalid/h1khub-5.1.10.deb",
+  "md5": "0123456789abcdef0123456789abcdef"
+}

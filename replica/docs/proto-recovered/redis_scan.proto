@@ -1,0 +1,32 @@
+// redis_scan.proto
+syntax = "proto3";
+
+package proto_model;
+option go_package = ".;proto_model";
+
+
+// 键的详细信息
+message KeyInfo {
+  string key = 1;                                    // 完整键名
+  string name = 2;                                   // 显示名称（去掉前缀后的部分）
+  string type = 3;                                   // 键类型，目录时为"dir"
+  int32 depth = 4;                                   //深度
+  int64 ttl = 5;                                     // TTL时间，目录时为0
+  int64 memoryUsage = 6;                            // 内存占用字节数，目录时为-1
+  int64 subCount = 7;                               // 子项数量
+  bytes value = 8;                                  // 键值
+  string text = 9;
+  int64 endTime = 10;
+  repeated KeyInfo children = 11;
+  bool showValue = 12;
+}
+
+// 扫描结果
+message ScanResult {
+  repeated KeyInfo keys = 1;                         // 键信息列表
+  bool hasNext = 2;                                 // 是否还有更多数据
+  uint64 cursor = 3;                                 // 当前游标位置
+  int64 total = 4;                                   // 已扫描的总键数
+  int64 totalPage = 5;                                // 总页数
+  int64 length = 6;                                    //总键数量
+}

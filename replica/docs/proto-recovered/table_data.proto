@@ -1,0 +1,32 @@
+syntax = "proto3";
+package proto_model;
+option go_package = ".;proto_model";
+
+message TableDataResponse {
+  ResultWrapper data = 1;
+  int64 offset = 2;
+  int64 totalCount = 3;
+  int64 totalPage = 4;
+}
+
+message ResultWrapper {
+  repeated ResultCol cols = 1;
+  repeated ResultRow rows = 2;
+}
+
+message ResultCol {
+  string name = 1;
+  string type = 2;
+  optional bool nullable = 3;
+  optional int64 length = 4;
+  optional int64 scale = 5;
+  optional int64 precision = 6;
+  int32 formatType = 7;
+  string fullType = 8;
+}
+
+message ResultRow {
+  repeated bool nulls = 1;
+  repeated string cols = 2;
+  optional string rowId = 3;
+}

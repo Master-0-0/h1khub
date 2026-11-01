@@ -1,0 +1,29 @@
+syntax = "proto3";
+package proto_model;
+option go_package = ".;proto_model";
+import "table_data.proto";
+
+
+message SqlExecuteExplainResponse {
+  repeated SqlExecuteExplainStatus data = 1;
+}
+
+message SqlExecuteProgressiveData{
+  int32 index = 1;
+  repeated ResultRow rows = 2;
+  int64 time = 3;
+}
+
+message SqlExecuteExplainStatus {
+  string  sql = 1;
+  bool status = 2;
+  bool isQuery = 3;
+  string error = 4;
+  int64 lastId = 5;
+  int64 rowsAffected = 6;
+  ResultWrapper result = 7;
+  ResultWrapper explainResult = 8;
+  int64 time = 9;
+}
+
+

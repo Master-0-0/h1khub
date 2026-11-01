@@ -1,0 +1,94 @@
+功能域,功能,状态,后端实现,前端入口,备注
+资产,21 种资产类型,已实现,store.py ASSET_TYPES,资产树/新建连接,数值与拆解报告一致
+资产,目录/嵌套/展开,已实现,store.py,AssetTree,
+资产,资产 CRUD,已实现,store.py / app.py,资产对话框,含复制、收藏、颜色
+资产,导入/导出 JSON,已实现,store.py,资产面板,含版本号
+资产,全局搜索,已实现,-,GlobalSearch,Ctrl+K
+资产,最近历史,已实现,store.py history,资产面板/首页,Ctrl+E
+资产,多标签工作区,已实现,-,TabBar,
+资产,资产地图,已实现,assetmap_svc.py / GET /api/asset-map,左侧导航 / 资产面板「更多」,连接类资产拓扑；跳板/SSH 依赖边、分层、孤立区、循环、缩放平移、搜索筛选、选中链详情；test_assetmap.py PASS=35
+资产,批量执行,已实现,app.py /api/batch/exec,BatchExecDialog,多台 SSH 并行
+资产,云同步/会员/支付,未实现,-,-,本地优先，刻意不做
+终端,本地 PTY,已实现,sessions.py,TerminalView,
+终端,SSH 密码/私钥/口令,已实现,sshlib.py,Ssh 编辑器,
+终端,SSH Agent,已实现,sshlib.py,Ssh 编辑器,agentSocket 指定；临时 agent 端到端验证
+终端,跳板机,已实现,hub.py ssh_chain + sshlib.py connect_chain,Ssh 编辑器（单指针 + 链预览/循环提示）,递归最多 8 个跳板（目标不计入）；由外到内逐跳认证与 TOFU；DB/Redis 隧道/Docker/SFTP/SCP/终端均复用；test_jumps.py 实测 0-4 层
+终端,SOCKS5/HTTP 代理,已实现,sshlib.py,Ssh 编辑器/高级,本机 SOCKS5/HTTP 代理端到端验证
+终端,known_hosts TOFU,已实现,sshlib.py,-,指纹变更拒绝
+终端,终端增强,已实现,xterm.js + addon-webgl,TerminalView,搜索/链接/字号/回滚/WebGL/日志/重连
+终端,Telnet,已实现,sessions.py IAC,AssetDialog,本机 telnet fixture 端到端验证
+终端,串口,未实现,-,-,
+终端,RDP/VNC,未实现,-,-,原 Linux 版 RDP 也不可用
+终端,X11 转发,已实现,sessions.py request_x11,终端/资产高级,DISPLAY 转发 + xdpyinfo 验证
+终端,分屏/多窗口,已实现,前端 pane 模型（App.vue/TabBar.vue）,标签右键菜单「垂直/水平分屏」/ Ctrl+Shift+= / Ctrl+Shift+- / 资产右键「同屏打开」/「在新窗口打开」,最多 4 面板；拖动分隔条调比例；Ctrl+方向键切焦点；标签拖拽搬迁未做
+终端,命令广播,已实现,app.py /api/sessions/broadcast,BroadcastDialog,多会话同时注入，含跳板
+文件,SFTP 浏览,已实现,fsops.py,FilePane,
+文件,上传/下载,已实现,fsops.py,FilePane,流式
+文件,在线编辑,已实现,fsops.py,FilePane,
+文件,mkdir/rename/delete/chmod,已实现,fsops.py,FilePane,
+文件,SCP 上传/下载,已实现,scp_svc.py,FilePane,端到端验证 + 错误路径
+文件,明文 FTP,已实现,ftp_svc.py,FilesView,列目录/上传/下载/重命名/删除/编辑
+文件,断点续传/trzsz/ZModem,部分实现,zmodem.js + lrzsz；trzsz_svc.py（隧道协议对接远端 trz/tsz）,TerminalView（ZModem 接管 + trzsz 上传/下载按钮）,ZModem 与 trzsz 均端到端验证；断点续传未单独实现
+文件,跨服务器传输,已实现,transfer_svc.py,FilePane 右键,SFTP→SFTP 文件/目录，覆盖/跳过
+文件,压缩/解压,已实现,archive_svc.py + app.py /api/sftp/archive/* + /api/fs/archive/*,FilePane 多选/右键/选择栏,远端 tar/zip/7z 与本地标准库；越界成员拒绝；test_archive.py PASS=135、test_archive_ui.py PASS=27
+数据库,MySQL/MariaDB,已实现,db.py MySQLAdapter,DbView/DbTable,
+数据库,PostgreSQL,已实现,db.py PostgresAdapter,DbView/DbTable,
+数据库,SQLite,已实现,db.py SQLiteAdapter,DbView/DbTable,
+数据库,DuckDB,已实现,db.py DuckDBAdapter,DbView/DbTable,嵌入式文件库 + ATTACH 跨库
+数据库,对象树,已实现,db.py,DbView,表/视图/例程
+数据库,分页/排序/筛选,已实现,db.py,DbTable,
+数据库,行内编辑/增删,已实现,db.py,DbTable,需要主键
+数据库,实时信息/元数据缓存,已实现,dbsessions.py,DbRealtimeDialog,20s TTL + refresh
+数据库,DDL,已实现,db.py,DbTable,PostgreSQL 由元数据生成
+数据库,SQL 编辑器,已实现,-,DbQuery,CodeMirror 6
+数据库,Explain,已实现,db.py,DbQuery,
+数据库,导出 CSV/JSON/SQL/XLSX/TXT,已实现,app.py,DbTable,
+数据库,SSH 隧道,已实现,hub.py,DbView 配置,
+数据库,事务,已实现,dbsessions.py / db.py,DbQuery 事务条,会话级 BEGIN/COMMIT/ROLLBACK
+数据库,结构同步/数据同步,已实现,dbsync.py,DbSyncDialog,按表；MySQL/PG 实测
+数据库,表结构编辑/索引/外键,已实现,dbsessions.py,DbSchemaDialog,MySQL/PG 实测；SQLite 限制项报错
+数据库,导入 .sql,已实现,dbsessions.py run_script,DbImportDialog,事务/遇错停止/逐语句结果；XLSX 后置
+数据库,SQL Server/Oracle/ClickHouse/达梦/Kingbase/MongoDB,部分实现,ClickHouseAdapter（clickhouse-driver）、MongoAdapter（pymongo）、PostgresAdapter（Kingbase 方言）、SQLServerAdapter（pymssql）、OracleAdapter（oracledb thin）、DamengAdapter（dmPython）,ConnectionPicker / AssetDialog / DbView,ClickHouse 26.10.3.7、MongoDB 7.0.14、达梦 DM8（dm8_20250506_rev270902，52360）、Oracle 19c SE2（ecourse.org:1521/ol8.ecourse.org，SCOTT，EMP 14 行/DEPT 4 行，test_oracle PASS=50）、SQL Server 2019 15.0.4500.2 Developer（127.0.0.1:14330，hexhub_demo users/orders，SHOWPLAN_XML/DDL/探针表增改删读回/UI 2 行，test_sqlserver PASS=32）均为真实实例验证；SQL Server 2022 镜像在本机 VMware+6.19 内核下 PAL 自旋（chroot 直跑同样复现），改用 2019 镜像；Kingbase 走 PostgreSQL 方言未单独实测
+Redis,连接/DB 列表,已实现,redis_svc.py,RedisView,
+Redis,SCAN/键列表,已实现,redis_svc.py,RedisView,
+Redis,String/Hash/List/Set/ZSet/Stream,已实现,redis_svc.py,RedisView,
+Redis,批量删除/重命名/设置值/TTL,已实现,redis_svc.py batch_*,RedisBatchDialog,glob 预览后执行
+Redis,键管理/TTL,已实现,redis_svc.py,RedisView,新建/重命名/删除/TTL + 批量扫描
+Redis,控制台,已实现,redis_svc.py,RedisView,
+Redis,实时信息,已实现,redis_svc.py,RedisView,
+Redis,集群/RedisJSON,已实现,h1khub_json 模块 + RedisView,RedisView JSON 编辑器,集群已实测；JSON 仅根路径
+Docker,本地 socket / SSH / TCP 远端,已实现,docker_svc.py,DockerView,三种均实测
+Docker,容器列表/启停/重启/删除/创建/重命名/pause/top,已实现,docker_svc.py,DockerView,
+Docker,日志/详情/stats,已实现,docker_svc.py,DockerView,
+Docker,容器终端,已实现,sessions.py PTY,DockerView,本地/SSH/TCP 三种均实测
+Docker,镜像/卷/网络,已实现,docker_svc.py,DockerView,
+Docker,Compose 读写/up/down/stop/restart,已实现,docker_svc.py compose_*,DockerView Compose,临时项目实测
+Docker,容器文件浏览/读写/上传下载,已实现,docker_svc.py fs_*,ContainerFiles,临时容器实测
+Docker,私有仓库登录,部分实现,docker_svc.py registry_login,DockerView,CLI+错误路径；无真实仓库
+Docker,本地 OCI registry 发布/拉取,已实现,tools/oci_registry.py（/v2、manifests、blobs、catalog）+ registry_svc.py,DockerView → 镜像 → 本地仓库,docker save 转 OCI layout；真实 docker pull，RepoDigest 与发布 digest 一致
+AI,OpenAI 兼容 + Anthropic,已实现,ai.py,AiChat,
+AI,流式对话,已实现,ai.py,AiChat,
+AI,供应商预设 13 家,已实现,ai.py provider_urls,SettingsDialog,13 家 + 自定义；真实 Key 未接入
+AI,工具调用,已实现,ai.py tools,AiChat,21 个工具（含 SCP/隧道/FTP）
+AI,审批策略,已实现,ai.py / settings,AiChat,可本会话记住
+AI,会话持久化,已实现,store.py chat_*,AiChat,
+AI,模型列表/连通性测试,已实现,app.py /api/ai/*,SettingsDialog,
+AI,MCP/图片输入/三种专用助手,未实现,-,-,统一通用 Agent；MCP 已预留（docs/reserved-slots.md#98-mcp），图片输入/专用助手未实现
+设置,主题/强调色,已实现,-,SettingsDialog,暗/亮/跟随系统 + 4 accent
+设置,中英文,已实现,-,SettingsDialog,
+设置,终端/编辑器参数,已实现,-,SettingsDialog,
+设置,快捷键,已实现,App.vue,-,"Ctrl+K/E/,/`/W, Alt+1..9"
+设置,锁屏/托盘/多窗口,部分实现,前端 pane 模型 + lock_svc.py,标签右键「在新窗口打开」 + 设置→安全,多窗口/分屏已实现并实测；锁屏已实现并实测（本地口令门、失败退避、空闲锁定、刷新/新标签仍锁，scripts/test_lock.py PASS=50）；系统托盘 unavailable（浏览器形态无托盘）
+更新,版本检查,已实现,update_svc.py / GET /api/update/check,设置→更新 / 关于页 / 关于窗口,读取本机 manifest（file:// 或 127.0.0.1 http(s)）并按数值比较 version/build；只读、不下载、不访问云端；scripts/test_update.py PASS=63
+更新,热更新,未实现,-,-,已预留（docs/reserved-slots.md#92-热更新）；POST /api/update/start、GET /api/update/status 仍 501；不下载/解压/重启
+更新,更新通道,已实现,update_svc.py / POST /api/update/channel,设置→更新,stable/experimental × production/test 白名单；{channel}/{env} 模板或目录选择 manifest；不触发下载/重启
+安全,AES-256-GCM 配置加密,已实现,store.py,-,全部资产配置
+安全,本地 Token 鉴权,已实现,app.py,-,401 session invalid
+安全,known_hosts,已实现,sshlib.py,-,
+安全,AI 审批,已实现,ai.py,AiChat,危险命令强制
+安全,云加密,未实现,-,-,已预留（docs/reserved-slots.md#95-云加密），unavailable（依赖云端会员 RSA 体系）
+安全,遥测,无,-,-,
+未知,插件市场,未实现,-,-,已预留（docs/reserved-slots.md#99-插件市场），未实现（原产品为编译期内置）
+终端,生成私钥/复制公钥,已实现,key_svc.py,AssetDialog,ed25519/RSA + ssh-copy-id
+终端,共享密码对,已实现,store.py / hub.py,AssetDialog,SSHPasswordPair 引用
+终端,Chrome 服务器代理,已实现,chrome_proxy_svc.py + tunnel_svc.py,资产右键「通过服务器代理 Chrome」/「更多 → Chrome 代理（查看/停止）…」,SOCKS5 隧道 + 临时 Chrome 配置；浏览器退出/停止自动回收；3 跳 SSH 链 + 真实 Chrome 实测；test_chromeproxy.py PASS=75、test_chromeproxy_jumps.py PASS=23
