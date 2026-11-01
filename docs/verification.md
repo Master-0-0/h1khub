@@ -932,7 +932,7 @@ Oracle 在 `DbView.vue` 里不是 schema 树（`isSchemaTree` 只含 postgresql/
 | 本地功能口径 | 77/80（96.3%） | **78/80（97.5%）** |
 
 同步文件：`docs/completion-audit.csv`（41 行）、`docs/feature-matrix.csv`（数据库行）、`README.md`、
-根目录 `复刻完成度核查报告.md`、`复刻交付说明.md`，以及本节。
+`逆向资料/` 下的 `复刻完成度核查报告.md`、`复刻交付说明.md`，以及本节。
 
 全量回归（第十八轮结束）：
 
@@ -1162,7 +1162,7 @@ ERRORS: []
 
 同步文件：`docs/completion-audit.csv`（40 行）、`docs/feature-matrix.csv`（数据库行）、`README.md`
 （数据库表 / 演示资产表 / 未实现清单 / 验证摘要，并新增 `scripts/start_mssql.sh` 说明）、
-根目录 `复刻完成度核查报告.md`、`复刻交付说明.md`，以及本节。
+`逆向资料/` 下的 `复刻完成度核查报告.md`、`复刻交付说明.md`，以及本节。
 
 ### 24.9 限制
 
@@ -1193,7 +1193,7 @@ ERRORS: []
 
 ### 25.2 原版证据（读产物字节，不凭记忆）
 
-原版前端打包在 `extract/opt/hexhub/hexhub-backend`（Go 二进制内嵌前端 assets）。直接读字节：
+原版前端打包在 `逆向资料/extract/opt/hexhub/hexhub-backend`（Go 二进制内嵌前端 assets）。直接读字节：
 
 ```js
 // 终端/串口标签右键菜单（hexhub-backend @ offset 68852014）
@@ -1294,7 +1294,7 @@ OK: 30 套件 + 0 次 ui_flow（首轮），FAIL: test_zmodem、ui_flow
 剩余唯一本地缺口仍是默认不做的 **95 云加密**。
 
 同步文件：`docs/completion-audit.csv`（89）、`docs/feature-matrix.csv`（终端·分屏/多窗口→已实现；
-设置·锁屏/托盘/多窗口→部分实现）、`README.md`、根目录 `复刻完成度核查报告.md` / `复刻交付说明.md`、本节。
+设置·锁屏/托盘/多窗口→部分实现）、`README.md`、`逆向资料/` 下的 `复刻完成度核查报告.md` / `复刻交付说明.md`、本节。
 
 ### 25.7 限制
 

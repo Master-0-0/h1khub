@@ -9,19 +9,6 @@ known_hosts
 runtime.json
 .DS_Store
 
-# ===== 仓库根目录的逆向证据 / 交付文档 =====
-# 仅存在于本机，不属于项目源码，不纳入版本库。
-/*.deb
-/extract/
-/artifacts/
-/shots/
-/hexhub-running.png
-/HexHub-5.1.9-REA-逆向拆解.md
-/hexhub-功能矩阵.csv
-/HexHub-功能体验报告.md
-/开源替代调研.md
-/REA-本地部署.md
-/rea-env.sh
-/复刻交付说明.md
-/复刻完成度核查报告.md
-/backup-jumps-*/
+# ===== 逆向工程证据 / 交付文档 =====
+# 全部归档在 逆向资料/，不属于项目源码，不纳入版本库。
+/逆向资料/
