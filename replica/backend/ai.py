@@ -16,6 +16,7 @@ from db import DatabaseError
 from docker_svc import DockerError
 from ftp_svc import FTPError
 from redis_svc import RedisError
+from store import ASSET_TYPES, SECRET_KEYS, TYPE_NAME
 import agent_backup
 from util import b64decode_str, clamp_text, human_bytes, jsonable, new_id, strip_ansi
 
@@ -24,7 +25,8 @@ MAX_TOOL_OUTPUT = 100_000
 SYSTEM_PROMPT = """你是 H1KHub（数据库 / SSH / SFTP / Docker 一体化桌面工具）内置的 AI 助手，运行在用户本机的 H1KHub 客户端里。
 
 你可以调用工具真实地操作本机与已保存的资产：
-- 列出资产、浏览目录、读写文件（本机或远程 SFTP）
+- 列出/读取/新建/修改/移动/删除资产，读写资产密钥（变更与密钥操作都需要审批）
+- 浏览目录、读写文件（本机或远程 SFTP）
 - 执行 shell 命令（本机或 SSH 远程）
 - 查询数据库（MySQL / PostgreSQL / SQLite）、执行 SQL
 - 执行 Redis 命令、查看 Docker 容器与日志、启动/停止/重启 Docker 容器
@@ -35,7 +37,7 @@ SYSTEM_PROMPT = """你是 H1KHub（数据库 / SSH / SFTP / Docker 一体化桌�
 行为准则：
 1. 先用工具确认事实，再下结论；不要编造文件内容、命令输出或查询结果。
 2. 危险或破坏性操作必须先说明影响，并等待审批；绝不绕过审批。
-3. 不泄露口令、私钥、API Key 等敏感信息；引用资产时用 ID 与名称，不回显密钥。
+3. 资产密钥由 asset_secret_read / asset_secret_write 明文读写（都要审批）；除非用户明确要求，不要主动复述密钥，也不要把它写进文件或命令。
 4. 对本地系统与远程服务器保持最小改动原则；删除/覆盖前先确认。
 5. 使用用户当前的语言回答，回答简洁、可执行，必要时给出命令与回滚方式。
 6. 数据库标识符遵循目标方言的引号规则；大结果集先分页或加 LIMIT。
@@ -63,6 +65,97 @@ def _tool(name: str, description: str, properties: dict | None = None, required:
 
 TOOLS: list[dict] = [
     _tool("list_assets", "列出 H1KHub 中保存的所有资产（连接/目录/查询），返回 id、名称、类型和父子关系。"),
+    _tool(
+        "asset_get",
+        "读取单个资产的详情：类型、父子关系、别名、颜色、非密钥配置与密钥字段名（不含密钥值）。只读，无需审批。",
+        {
+            "asset_id": {"type": "string", "description": "资产 ID"},
+            "include_children": {"type": "boolean", "description": "是否同时返回直接子节点，默认 false"},
+        },
+        ["asset_id"],
+    ),
+    _tool(
+        "asset_create",
+        "新建资产（需要审批）。config 不能包含 password/privateKey/token 等密钥字段；"
+        "密钥请在创建后用 asset_secret_write 写入。",
+        {
+            "type": {"type": "string", "description": "资产类型名称，如 Dir / SSH / FTP / DB / Docker / Redis"},
+            "name": {"type": "string", "description": "资产名称（1-200 字符）"},
+            "parent_id": {"type": "string", "description": "父目录 ID；留空表示根目录"},
+            "alias": {"type": "string", "description": "别名（可选，≤100 字符）"},
+            "color": {"type": "string", "description": "颜色 #RRGGBB（可选）"},
+            "config": {"type": "object", "description": "非密钥配置（host/port/username/database 等）"},
+            "allow_duplicate": {"type": "boolean", "description": "允许同父目录下重名，默认 false"},
+        },
+        ["type", "name"],
+    ),
+    _tool(
+        "asset_update",
+        "修改资产的名称/别名/颜色/非密钥配置（需要审批）。不支持修改父目录（用 asset_move）和类型；"
+        "config 按键合并（值为 null 表示写入 null，不会删除键）。",
+        {
+            "asset_id": {"type": "string", "description": "资产 ID"},
+            "name": {"type": "string", "description": "新名称"},
+            "alias": {"type": "string", "description": "新别名；空字符串表示清空"},
+            "color": {"type": "string", "description": "新颜色 #RRGGBB；null 表示清空"},
+            "config": {"type": "object", "description": "需要合并的非密钥配置"},
+        },
+        ["asset_id"],
+    ),
+    _tool(
+        "asset_move",
+        "移动资产到另一个目录或根目录（需要审批）。parent_id 传 null 表示根目录；目标必须是目录，且不能成环。",
+        {
+            "asset_id": {"type": "string", "description": "要移动的资产 ID"},
+            "parent_id": {"type": ["string", "null"], "description": "目标目录 ID；null 表示根目录"},
+            "before_id": {"type": "string", "description": "可选：移动到该兄弟节点之前"},
+        },
+        ["asset_id", "parent_id"],
+    ),
+    _tool(
+        "asset_delete",
+        "删除资产（需要审批，不可撤销）。删除非空目录必须 recursive=true；任何删除都必须 confirm=true。"
+        "未确认时会在审批前返回受影响资产数量与名称。",
+        {
+            "asset_id": {"type": "string", "description": "资产 ID"},
+            "recursive": {"type": "boolean", "description": "递归删除子资产，默认 false"},
+            "confirm": {"type": "boolean", "description": "必须为 true，表示已确认删除"},
+        },
+        ["asset_id"],
+    ),
+    _tool(
+        "asset_secret_read",
+        "读取资产密钥明文（需要审批）。只允许读取 SECRET_KEYS 白名单字段；"
+        "返回字段名、是否存在、长度与明文值。",
+        {
+            "asset_id": {"type": "string", "description": "资产 ID"},
+            "fields": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "可选：点路径（如 password、proxy.password）；留空读取全部密钥字段",
+            },
+        },
+        ["asset_id"],
+    ),
+    _tool(
+        "asset_secret_write",
+        "写入或清除资产密钥（需要审批，明文）。字段必须在 SECRET_KEYS 白名单内；"
+        "空值不能写入，清空请用 clear；set 与 clear 不能指向同一字段。",
+        {
+            "asset_id": {"type": "string", "description": "资产 ID"},
+            "set": {
+                "type": "object",
+                "additionalProperties": {"type": "string"},
+                "description": "要写入的密钥：{字段路径: 明文值}",
+            },
+            "clear": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "要清除的密钥字段路径",
+            },
+        },
+        ["asset_id"],
+    ),
     _tool(
         "list_dir",
         "列出一个目录的内容。asset_id 为空表示本机文件系统，否则为对应的 SSH/SFTP 资产。",
@@ -323,6 +416,300 @@ WRAPPER_TOKENS = re.compile(r"(^|[\s;&|()])(sudo|doas|exec|nohup|setsid|env)(\s|
 
 SQL_READ = re.compile(r"^\s*(select|show|describe|desc|explain|with|pragma|values)\b", re.I)
 DOCKER_ACTIONS = ("start", "stop", "restart")
+
+# ---------------------------------------------------------------- asset CRUD
+# 资产 CRUD 工具的边界常量。密钥按用户要求明文返回/展示（不再做掩码），但仍
+# 保持“独立工具 + 独立审批 + 白名单字段 + 审计只记元信息”的约束。
+ASSET_NAME_MAX = 200
+ASSET_ALIAS_MAX = 100
+ASSET_CONFIG_MAX_BYTES = 64 * 1024
+ASSET_CONFIG_MAX_DEPTH = 8
+ASSET_CONFIG_OUTPUT_BYTES = 20_000
+ASSET_DESCENDANT_LIMIT = 5_000
+ASSET_SECRET_MAX_FIELDS = 20
+ASSET_SECRET_MAX_VALUE_BYTES = 8_192
+ASSET_SECRET_OUTPUT_CHARS = 32_000
+ASSET_SECRET_PREVIEW_CHARS = 500
+ASSET_APPROVAL_KINDS = (
+    "asset_create",
+    "asset_update",
+    "asset_move",
+    "asset_delete",
+    "asset_secret_read",
+    "asset_secret_write",
+)
+ASSET_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+ASSET_SECRET_PATH_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$")
+ASSET_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
+
+class AssetArgError(Exception):
+    """Asset tool validation failure carrying a structured tool error."""
+
+    def __init__(self, code: str, message: str, status: int = 400, **extra: Any) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.status = status
+        self.extra = extra
+
+    def payload(self) -> dict:
+        error: dict[str, Any] = {"code": self.code, "status": self.status, "message": self.message}
+        error.update(self.extra)
+        return {"error": error}
+
+
+def _asset_failure(code: str, label: str, exc: Exception, **extra: Any) -> dict:
+    error: dict[str, Any] = {
+        "code": code,
+        "status": 500,
+        "message": f"{label}：{type(exc).__name__}: {exc}",
+    }
+    error.update(extra)
+    return {"error": error}
+
+
+def _preview(value: Any, limit: int = 200) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = json.dumps(value, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            text = str(value)
+    return clamp_text(text, limit)
+
+
+def _asset_type_id(raw: Any) -> int:
+    if isinstance(raw, bool):
+        raise AssetArgError("invalid_type", "type 必须是资产类型名称或整数")
+    if isinstance(raw, str):
+        name = raw.strip()
+        if name in ASSET_TYPES:
+            return ASSET_TYPES[name]
+        if name.isdigit():
+            raw = int(name)
+        else:
+            raise AssetArgError("invalid_type", f"未知资产类型：{name[:40]}", allowed=sorted(ASSET_TYPES))
+    if isinstance(raw, int):
+        if raw in TYPE_NAME:
+            return raw
+        raise AssetArgError("invalid_type", f"未知资产类型 id：{raw}", allowed=sorted(TYPE_NAME))
+    raise AssetArgError("invalid_type", "type 必须是资产类型名称或整数")
+
+
+def _asset_text(raw: Any, field: str, limit: int, *, required: bool) -> str | None:
+    if raw is None:
+        if required:
+            raise AssetArgError(f"invalid_{field}", f"{field} 不能为空")
+        return None
+    if not isinstance(raw, str):
+        raise AssetArgError(f"invalid_{field}", f"{field} 必须是字符串")
+    value = raw.strip()
+    if not value:
+        if required:
+            raise AssetArgError(f"invalid_{field}", f"{field} 不能为空")
+        return None
+    if ASSET_CONTROL_CHARS.search(value):
+        raise AssetArgError(f"invalid_{field}", f"{field} 不能包含控制字符")
+    if len(value) > limit:
+        raise AssetArgError(f"invalid_{field}", f"{field} 不能超过 {limit} 个字符")
+    return value
+
+
+def _asset_color(raw: Any) -> str | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise AssetArgError("invalid_color", "color 必须是 #RRGGBB 字符串")
+    value = raw.strip()
+    if not value:
+        return None
+    if not ASSET_COLOR_RE.match(value):
+        raise AssetArgError("invalid_color", "color 必须是 #RRGGBB")
+    return value.lower()
+
+
+def _asset_opt_id(raw: Any, field: str) -> str | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise AssetArgError(f"invalid_{field}", f"{field} 必须是字符串或 null")
+    value = raw.strip()
+    return value or None
+
+
+def _asset_id_arg(args: dict) -> str:
+    value = _asset_opt_id(args.get("asset_id"), "asset_id")
+    if not value:
+        raise AssetArgError("invalid_asset_id", "缺少 asset_id")
+    return value
+
+
+def _secret_paths_in(value: Any, prefix: str = "") -> list[str]:
+    out: list[str] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            path = f"{prefix}.{key}" if prefix else str(key)
+            if key in SECRET_KEYS:
+                out.append(path)
+            elif isinstance(item, (dict, list)):
+                out.extend(_secret_paths_in(item, path))
+    elif isinstance(value, list):
+        for idx, item in enumerate(value):
+            out.extend(_secret_paths_in(item, f"{prefix}[{idx}]"))
+    return out
+
+
+def _config_depth(value: Any, depth: int = 1) -> int:
+    if isinstance(value, dict) and value:
+        return max([depth] + [_config_depth(item, depth + 1) for item in value.values()])
+    if isinstance(value, list) and value:
+        return max([depth] + [_config_depth(item, depth + 1) for item in value])
+    return depth
+
+
+def _asset_config(raw: Any) -> dict:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise AssetArgError("invalid_config", "config 必须是对象")
+    secrets = _secret_paths_in(raw)
+    if secrets:
+        raise AssetArgError(
+            "secret_in_config",
+            "config 不能包含密钥字段；请使用 asset_secret_write 写入密钥",
+            fields=secrets[:10],
+        )
+    if _config_depth(raw) > ASSET_CONFIG_MAX_DEPTH:
+        raise AssetArgError("invalid_config", f"config 嵌套不能超过 {ASSET_CONFIG_MAX_DEPTH} 层")
+    try:
+        size = len(json.dumps(raw, ensure_ascii=False, default=str).encode("utf-8"))
+    except (TypeError, ValueError):
+        raise AssetArgError("invalid_config", "config 不能序列化为 JSON")
+    if size > ASSET_CONFIG_MAX_BYTES:
+        raise AssetArgError("config_too_large", f"config 超过 {ASSET_CONFIG_MAX_BYTES} 字节")
+    return raw
+
+
+def _asset_parent(store, parent_id: str | None, *, asset_id: str | None = None) -> dict | None:
+    if parent_id is None:
+        return None
+    parent = store.get_asset(parent_id)
+    if not parent:
+        raise AssetArgError("invalid_parent", f"父目录不存在：{parent_id}")
+    if parent["type"] != ASSET_TYPES["Dir"]:
+        raise AssetArgError("parent_not_dir", f"父节点不是目录：{parent['name']}")
+    if asset_id is not None:
+        if parent_id == asset_id:
+            raise AssetArgError("asset_cycle", "不能把资产移动到自身下面")
+        seen: set[str] = set()
+        node = parent
+        for _ in range(200):
+            pid = node.get("parentId")
+            if not pid:
+                break
+            if pid == asset_id:
+                raise AssetArgError("asset_cycle", "不能把资产移动到自己的子目录")
+            if pid in seen:
+                break
+            seen.add(pid)
+            node = store.get_asset(pid)
+            if not node:
+                break
+    return parent
+
+
+def _asset_duplicate(store, name: str, parent_id: str | None, type_id: int, exclude_id: str | None = None) -> dict | None:
+    for asset in store.list_assets():
+        if asset["id"] == exclude_id:
+            continue
+        if asset["name"] == name and asset.get("parentId") == parent_id and asset["type"] == type_id:
+            return asset
+    return None
+
+
+def _asset_descendants(assets: list[dict], root_id: str) -> list[dict]:
+    children: dict[str | None, list[dict]] = {}
+    for asset in assets:
+        children.setdefault(asset.get("parentId"), []).append(asset)
+    out: list[dict] = []
+    seen = {root_id}
+    queue = [root_id]
+    while queue:
+        current = queue.pop(0)
+        for child in children.get(current, []):
+            if child["id"] in seen:
+                continue
+            seen.add(child["id"])
+            out.append(child)
+            queue.append(child["id"])
+    return out
+
+
+def _asset_summary(asset: dict) -> dict:
+    return {
+        "id": asset["id"],
+        "name": asset["name"],
+        "type": asset["type"],
+        "typeName": asset.get("typeName"),
+        "parentId": asset.get("parentId"),
+        "alias": asset.get("alias") or "",
+        "color": asset.get("color"),
+        "sort": asset.get("sort"),
+        "updatedAt": asset.get("updatedAt"),
+    }
+
+
+def _asset_secret_path(raw: Any) -> str:
+    if not isinstance(raw, str):
+        raise AssetArgError("invalid_secret_path", "密钥字段必须是点路径字符串")
+    path = raw.strip()
+    if not ASSET_SECRET_PATH_RE.match(path):
+        raise AssetArgError("invalid_secret_path", f"非法密钥路径：{path[:80]}")
+    leaf = path.rsplit(".", 1)[-1]
+    if leaf not in SECRET_KEYS:
+        raise AssetArgError(
+            "invalid_secret_field",
+            f"{leaf} 不是允许的密钥字段",
+            allowed=sorted(SECRET_KEYS),
+        )
+    return path
+
+
+def _asset_secret_value(raw: Any) -> str:
+    if not isinstance(raw, str):
+        raise AssetArgError("invalid_secret_value", "密钥值必须是字符串")
+    if not raw:
+        raise AssetArgError("invalid_secret_value", "密钥值不能为空；清空请使用 clear")
+    if "\x00" in raw:
+        raise AssetArgError("invalid_secret_value", "密钥值不能包含 NUL")
+    if len(raw.encode("utf-8")) > ASSET_SECRET_MAX_VALUE_BYTES:
+        raise AssetArgError("invalid_secret_value", f"密钥值不能超过 {ASSET_SECRET_MAX_VALUE_BYTES} 字节")
+    return raw
+
+
+def _set_config_path(config: dict, path: str, value: Any) -> None:
+    node = config
+    parts = path.split(".")
+    for part in parts[:-1]:
+        child = node.get(part)
+        if not isinstance(child, dict):
+            child = {}
+            node[part] = child
+        node = child
+    node[parts[-1]] = value
+
+
+def _get_config_path(config: Any, path: str) -> Any:
+    node = config
+    for part in path.split("."):
+        if not isinstance(node, dict):
+            return None
+        node = node.get(part)
+    return node
 
 # ------------------------------------------------------------------ websearch
 # 降级策略（与原版 NewWebSearchTool 的差异，务必保持）：
@@ -783,6 +1170,9 @@ class ChatRunner:
     # ------------------------------------------------------------------ tools
     def _silent(self, kind: str, command: str = "", sql: str = "") -> bool:
         p = self.policy
+        if kind in ASSET_APPROVAL_KINDS:
+            # 资产与密钥变更永远审批，不提供静默开关。
+            return False
         if kind == "read_file":
             return bool(p.get("allowSilentFileRead", True))
         if kind == "write_file":
@@ -829,6 +1219,486 @@ class ChatRunner:
             {"id": a["id"], "name": a["name"], "type": a["type"], "typeName": a["typeName"], "parentId": a["parentId"]}
             for a in assets
         ]
+
+    # ------------------------------------------------------------ asset CRUD
+    def _asset_audit(self, kind: str, title: str, asset_id: str, fields: dict) -> str | None:
+        """Record an asset mutation; never let an audit failure fail the mutation."""
+        record = {"actor": "ai", "assetId": asset_id, **fields}
+        try:
+            detail = json.dumps(record, ensure_ascii=False, default=str, separators=(",", ":"))
+        except (TypeError, ValueError):
+            detail = str(record)
+        try:
+            self.store.add_history(kind, title, asset_id, clamp_text(detail, 900))
+            return None
+        except Exception as exc:  # audit must not mask a successful change
+            return f"{type(exc).__name__}: {exc}"
+
+    def _asset_restore(self, old: dict) -> str:
+        """Best-effort in-memory rollback using the pre-change snapshot."""
+        try:
+            self.store.update_asset(
+                old["id"],
+                {
+                    "name": old["name"],
+                    "alias": old.get("alias"),
+                    "color": old.get("color"),
+                    "config": old.get("config") or {},
+                    "parentId": old.get("parentId"),
+                    "sort": old.get("sort"),
+                },
+            )
+            return "restored"
+        except Exception as exc:
+            return f"failed:{type(exc).__name__}"
+
+    async def tool_asset_get(self, args: dict):
+        try:
+            asset_id = _asset_id_arg(args)
+            asset = self.store.get_asset(asset_id)
+            if not asset:
+                raise AssetArgError("asset_not_found", f"资产不存在：{asset_id}", status=404)
+        except AssetArgError as exc:
+            return False, exc.payload()
+        out = _asset_summary(asset)
+        config = asset.get("config") or {}
+        try:
+            config_bytes = len(json.dumps(config, ensure_ascii=False, default=str).encode("utf-8"))
+        except (TypeError, ValueError):
+            config_bytes = 0
+        if config_bytes > ASSET_CONFIG_OUTPUT_BYTES:
+            out["configOmitted"] = True
+            out["configKeys"] = sorted(str(key) for key in config.keys())
+            out["configBytes"] = config_bytes
+        else:
+            out["config"] = config
+        out["secretFields"] = sorted(asset.get("secrets") or [])
+        if args.get("include_children"):
+            children = [item for item in self.store.list_assets() if item.get("parentId") == asset_id]
+            out["childCount"] = len(children)
+            out["children"] = [_asset_summary(item) for item in children[:200]]
+        return True, out
+
+    async def tool_asset_create(self, args: dict):
+        try:
+            type_id = _asset_type_id(args.get("type"))
+            name = _asset_text(args.get("name"), "name", ASSET_NAME_MAX, required=True)
+            parent_id = _asset_opt_id(args.get("parent_id"), "parent_id")
+            alias = _asset_text(args.get("alias"), "alias", ASSET_ALIAS_MAX, required=False)
+            color = _asset_color(args.get("color"))
+            config = _asset_config(args.get("config"))
+            parent = _asset_parent(self.store, parent_id)
+            if not bool(args.get("allow_duplicate")):
+                duplicate = _asset_duplicate(self.store, name, parent_id, type_id)
+                if duplicate:
+                    raise AssetArgError(
+                        "duplicate_name",
+                        f"同一父目录下已存在同名资产：{duplicate['name']}",
+                        assetId=duplicate["id"],
+                        allowDuplicate=True,
+                    )
+        except AssetArgError as exc:
+            return False, exc.payload()
+        detail = {
+            "action": "create",
+            "type": TYPE_NAME[type_id],
+            "name": name,
+            "parentId": parent_id,
+            "parentName": parent["name"] if parent else "(根目录)",
+            "configKeys": sorted(str(key) for key in config.keys()),
+            "alias": alias or "",
+            "color": color or "",
+        }
+        if not await self._require("asset_create", f"新建资产 {TYPE_NAME[type_id]} {name}", detail):
+            return False, "用户拒绝新建资产"
+        try:
+            asset = self.store.create_asset(type_id, name, parent_id, config, color, alias)
+        except Exception as exc:
+            return False, _asset_failure("asset_create_failed", "创建资产失败", exc)
+        audit_error = self._asset_audit(
+            "asset",
+            f"AI 新建资产 · {name}",
+            asset["id"],
+            {
+                "op": "create",
+                "tool": "asset_create",
+                "type": TYPE_NAME[type_id],
+                "parent": parent_id or "root",
+                "configKeys": ",".join(sorted(str(key) for key in config.keys())),
+            },
+        )
+        out = _asset_summary(asset)
+        out["audit"] = "failed" if audit_error else "ok"
+        if audit_error:
+            out["auditError"] = audit_error
+        return True, out
+
+    async def tool_asset_update(self, args: dict):
+        old = None
+        try:
+            asset_id = _asset_id_arg(args)
+            if "parent_id" in args and args.get("parent_id") is not None:
+                raise AssetArgError("use_asset_move", "修改父目录请使用 asset_move")
+            if args.get("type") is not None:
+                raise AssetArgError("invalid_type", "不支持修改资产类型")
+            old = self.store.get_asset(asset_id, include_secrets=True)
+            if not old:
+                raise AssetArgError("asset_not_found", f"资产不存在：{asset_id}", status=404)
+            patch: dict[str, Any] = {}
+            changes: list[dict] = []
+            if "name" in args:
+                name = _asset_text(args.get("name"), "name", ASSET_NAME_MAX, required=True)
+                if name != old["name"]:
+                    duplicate = _asset_duplicate(
+                        self.store, name, old.get("parentId"), old["type"], exclude_id=asset_id
+                    )
+                    if duplicate:
+                        raise AssetArgError(
+                            "duplicate_name",
+                            f"同一父目录下已存在同名资产：{duplicate['name']}",
+                            assetId=duplicate["id"],
+                            allowDuplicate=True,
+                        )
+                    patch["name"] = name
+                    changes.append({"field": "name", "from": old["name"], "to": name})
+            if "alias" in args:
+                alias = _asset_text(args.get("alias"), "alias", ASSET_ALIAS_MAX, required=False)
+                if (alias or None) != (old.get("alias") or None):
+                    patch["alias"] = alias
+                    changes.append({"field": "alias", "from": old.get("alias") or "", "to": alias or ""})
+            if "color" in args:
+                color = _asset_color(args.get("color"))
+                if (color or None) != (old.get("color") or None):
+                    patch["color"] = color
+                    changes.append({"field": "color", "from": old.get("color") or "", "to": color or ""})
+            if "config" in args:
+                config = _asset_config(args.get("config"))
+                if config:
+                    patch["config"] = config
+                    for key, value in config.items():
+                        if key in SECRET_KEYS:
+                            continue
+                        changes.append(
+                            {
+                                "field": f"config.{key}",
+                                "from": _preview((old.get("config") or {}).get(key)),
+                                "to": _preview(value),
+                            }
+                        )
+            if not patch:
+                raise AssetArgError("no_changes", "没有可应用的修改")
+        except AssetArgError as exc:
+            return False, exc.payload()
+        detail = {
+            "action": "update",
+            "assetId": asset_id,
+            "name": old["name"],
+            "changes": changes[:20],
+        }
+        if not await self._require("asset_update", f"修改资产 {old['name']}", detail):
+            return False, "用户拒绝修改资产"
+        try:
+            updated = self.store.update_asset(asset_id, patch)
+        except Exception as exc:
+            rollback = self._asset_restore(old)
+            return False, _asset_failure("asset_update_failed", "修改资产失败", exc, rollback=rollback)
+        if not updated:
+            return False, AssetArgError("asset_not_found", f"资产不存在：{asset_id}", status=404).payload()
+        audit_error = self._asset_audit(
+            "asset",
+            f"AI 修改资产 · {updated['name']}",
+            asset_id,
+            {
+                "op": "update",
+                "tool": "asset_update",
+                "fields": ",".join(sorted(str(key) for key in patch.keys())),
+                "changes": "; ".join(f"{item['field']}:{item['from']}->{item['to']}" for item in changes[:10]),
+            },
+        )
+        out = _asset_summary(updated)
+        out["changed"] = changes[:20]
+        out["audit"] = "failed" if audit_error else "ok"
+        if audit_error:
+            out["auditError"] = audit_error
+        return True, out
+
+    async def tool_asset_move(self, args: dict):
+        try:
+            asset_id = _asset_id_arg(args)
+            asset = self.store.get_asset(asset_id)
+            if not asset:
+                raise AssetArgError("asset_not_found", f"资产不存在：{asset_id}", status=404)
+            if "parent_id" not in args:
+                raise AssetArgError("invalid_parent", "缺少 parent_id（根目录传 null）")
+            parent_id = _asset_opt_id(args.get("parent_id"), "parent_id")
+            before_id = _asset_opt_id(args.get("before_id"), "before_id")
+            target = _asset_parent(self.store, parent_id, asset_id=asset_id)
+            if before_id and not self.store.get_asset(before_id):
+                raise AssetArgError("invalid_before", f"before_id 不存在：{before_id}")
+        except AssetArgError as exc:
+            return False, exc.payload()
+        detail = {
+            "action": "move",
+            "assetId": asset_id,
+            "name": asset["name"],
+            "fromParentId": asset.get("parentId"),
+            "toParentId": parent_id,
+            "toParentName": target["name"] if target else "(根目录)",
+            "beforeId": before_id,
+        }
+        if not await self._require("asset_move", f"移动资产 {asset['name']}", detail):
+            return False, "用户拒绝移动资产"
+        try:
+            self.store.move_asset(asset_id, parent_id, before_id)
+        except Exception as exc:
+            rollback = self._asset_restore(asset)
+            return False, _asset_failure("asset_move_failed", "移动资产失败", exc, rollback=rollback)
+        moved = self.store.get_asset(asset_id) or asset
+        audit_error = self._asset_audit(
+            "asset",
+            f"AI 移动资产 · {moved['name']}",
+            asset_id,
+            {
+                "op": "move",
+                "tool": "asset_move",
+                "from": asset.get("parentId") or "root",
+                "to": parent_id or "root",
+            },
+        )
+        out = _asset_summary(moved)
+        out["audit"] = "failed" if audit_error else "ok"
+        if audit_error:
+            out["auditError"] = audit_error
+        return True, out
+
+    async def tool_asset_delete(self, args: dict):
+        try:
+            asset_id = _asset_id_arg(args)
+            asset = self.store.get_asset(asset_id)
+            if not asset:
+                raise AssetArgError("asset_not_found", f"资产不存在：{asset_id}", status=404)
+            descendants = _asset_descendants(self.store.list_assets(), asset_id)
+            affected = [asset] + descendants
+            if len(affected) > ASSET_DESCENDANT_LIMIT:
+                raise AssetArgError(
+                    "too_many_descendants", f"受影响资产超过 {ASSET_DESCENDANT_LIMIT} 个"
+                )
+            recursive = bool(args.get("recursive"))
+            confirm = bool(args.get("confirm"))
+            names = [item["name"][:60] for item in affected[:20]]
+            if len(affected) > 1 and not recursive:
+                raise AssetArgError(
+                    "asset_not_empty",
+                    f"目录非空（共 {len(affected)} 个资产）；请传 recursive=true",
+                    count=len(affected),
+                    names=names,
+                )
+            if not confirm:
+                raise AssetArgError(
+                    "confirmation_required",
+                    "删除需要 confirm=true 明确确认",
+                    count=len(affected),
+                    names=names,
+                    recursive=recursive,
+                )
+        except AssetArgError as exc:
+            return False, exc.payload()
+        detail = {
+            "action": "delete",
+            "assetId": asset_id,
+            "name": asset["name"],
+            "recursive": recursive,
+            "count": len(affected),
+            "names": names,
+            "remaining": max(0, len(affected) - len(names)),
+            "note": "勾选“本会话记住”后，本轮后续 asset_delete 不再弹审批。",
+        }
+        if not await self._require("asset_delete", f"删除资产 {asset['name']}", detail):
+            return False, "用户拒绝删除资产"
+        try:
+            deleted = self.store.delete_asset(asset_id, recursive=recursive)
+        except Exception as exc:
+            return False, _asset_failure("asset_delete_failed", "删除资产失败", exc)
+        audit_error = self._asset_audit(
+            "asset-delete",
+            f"AI 删除资产 · {asset['name']}",
+            asset_id,
+            {
+                "op": "delete",
+                "tool": "asset_delete",
+                "count": len(affected),
+                "recursive": recursive,
+                "names": ",".join(names[:5]),
+            },
+        )
+        out = {
+            "ok": True,
+            "deletedCount": deleted,
+            "ids": [item["id"] for item in affected[:50]],
+            "audit": "failed" if audit_error else "ok",
+        }
+        if audit_error:
+            out["auditError"] = audit_error
+        return True, out
+
+    async def tool_asset_secret_read(self, args: dict):
+        try:
+            asset_id = _asset_id_arg(args)
+            asset = self.store.get_asset(asset_id, include_secrets=True)
+            if not asset:
+                raise AssetArgError("asset_not_found", f"资产不存在：{asset_id}", status=404)
+            config = asset.get("config") or {}
+            raw_fields = args.get("fields")
+            if raw_fields is None:
+                fields = sorted(
+                    path
+                    for path in set(_secret_paths_in(config))
+                    if ASSET_SECRET_PATH_RE.match(path)
+                )
+            else:
+                if not isinstance(raw_fields, list):
+                    raise AssetArgError("invalid_secret_request", "fields 必须是字符串数组")
+                if len(raw_fields) > ASSET_SECRET_MAX_FIELDS:
+                    raise AssetArgError(
+                        "invalid_secret_request", f"fields 最多 {ASSET_SECRET_MAX_FIELDS} 个"
+                    )
+                fields = []
+                for item in raw_fields:
+                    path = _asset_secret_path(item)
+                    if path not in fields:
+                        fields.append(path)
+            if not fields:
+                raise AssetArgError("no_secret_fields", "该资产没有可读取的密钥字段")
+            entries: list[dict] = []
+            previews: list[dict] = []
+            for path in fields:
+                value = _get_config_path(config, path)
+                present = isinstance(value, str) and bool(value)
+                entry = {
+                    "field": path,
+                    "present": present,
+                    "length": len(value.encode("utf-8")) if present else 0,
+                }
+                if present:
+                    entry["value"] = clamp_text(value, ASSET_SECRET_OUTPUT_CHARS)
+                    if len(value) > ASSET_SECRET_OUTPUT_CHARS:
+                        entry["truncated"] = True
+                    previews.append(
+                        {
+                            "field": path,
+                            "length": entry["length"],
+                            "preview": clamp_text(value, ASSET_SECRET_PREVIEW_CHARS),
+                        }
+                    )
+                entries.append(entry)
+        except AssetArgError as exc:
+            return False, exc.payload()
+        detail = {
+            "action": "read-secrets",
+            "assetId": asset_id,
+            "name": asset["name"],
+            "fields": previews,
+        }
+        if not await self._require("asset_secret_read", f"读取资产密钥 {asset['name']}", detail):
+            return False, "用户拒绝读取资产密钥"
+        audit_error = self._asset_audit(
+            "asset-secret-read",
+            f"AI 读取资产密钥 · {asset['name']}",
+            asset_id,
+            {"op": "secret-read", "tool": "asset_secret_read", "fields": ",".join(fields[:20])},
+        )
+        out = {"assetId": asset_id, "fields": entries, "audit": "failed" if audit_error else "ok"}
+        if audit_error:
+            out["auditError"] = audit_error
+        return True, out
+
+    async def tool_asset_secret_write(self, args: dict):
+        try:
+            asset_id = _asset_id_arg(args)
+            asset = self.store.get_asset(asset_id, include_secrets=True)
+            if not asset:
+                raise AssetArgError("asset_not_found", f"资产不存在：{asset_id}", status=404)
+            raw_set = args.get("set")
+            raw_clear = args.get("clear")
+            if raw_set is None and raw_clear is None:
+                raise AssetArgError("invalid_secret_request", "必须提供 set 或 clear")
+            if raw_set is not None and not isinstance(raw_set, dict):
+                raise AssetArgError("invalid_secret_request", "set 必须是对象")
+            if raw_clear is not None and not isinstance(raw_clear, list):
+                raise AssetArgError("invalid_secret_request", "clear 必须是字符串数组")
+            set_map: dict = raw_set or {}
+            clear_list: list = raw_clear or []
+            if len(set_map) + len(clear_list) > ASSET_SECRET_MAX_FIELDS:
+                raise AssetArgError(
+                    "invalid_secret_request", f"单次最多 {ASSET_SECRET_MAX_FIELDS} 个字段"
+                )
+            patch: dict[str, Any] = {}
+            set_fields: list[dict] = []
+            clear_fields: list[str] = []
+            set_paths: set[str] = set()
+            for raw_path, raw_value in set_map.items():
+                path = _asset_secret_path(raw_path)
+                if path in set_paths:
+                    continue
+                value = _asset_secret_value(raw_value)
+                _set_config_path(patch, path, value)
+                set_paths.add(path)
+                set_fields.append(
+                    {
+                        "field": path,
+                        "length": len(value.encode("utf-8")),
+                        "preview": clamp_text(value, ASSET_SECRET_PREVIEW_CHARS),
+                    }
+                )
+            for item in clear_list:
+                path = _asset_secret_path(item)
+                if path in set_paths:
+                    raise AssetArgError("invalid_secret_request", f"{path} 不能同时 set 与 clear")
+                if path in clear_fields:
+                    continue
+                _set_config_path(patch, path, "__CLEAR__")
+                clear_fields.append(path)
+            if not set_fields and not clear_fields:
+                raise AssetArgError("invalid_secret_request", "set 与 clear 不能都为空")
+        except AssetArgError as exc:
+            return False, exc.payload()
+        detail = {
+            "action": "write-secrets",
+            "assetId": asset_id,
+            "name": asset["name"],
+            "set": set_fields,
+            "clear": clear_fields,
+        }
+        if not await self._require("asset_secret_write", f"写入资产密钥 {asset['name']}", detail):
+            return False, "用户拒绝写入资产密钥"
+        try:
+            updated = self.store.update_asset(asset_id, {"config": patch})
+        except Exception as exc:
+            rollback = self._asset_restore(asset)
+            return False, _asset_failure("asset_secret_write_failed", "写入密钥失败", exc, rollback=rollback)
+        if not updated:
+            return False, AssetArgError("asset_not_found", f"资产不存在：{asset_id}", status=404).payload()
+        audit_error = self._asset_audit(
+            "asset",
+            f"AI 写入资产密钥 · {asset['name']}",
+            asset_id,
+            {
+                "op": "secret-write",
+                "tool": "asset_secret_write",
+                "set": ",".join(f"{item['field']}({item['length']}B)" for item in set_fields),
+                "clear": ",".join(clear_fields),
+            },
+        )
+        out = {
+            "ok": True,
+            "assetId": asset_id,
+            "updated": [{"field": item["field"], "length": item["length"]} for item in set_fields],
+            "cleared": clear_fields,
+            "audit": "failed" if audit_error else "ok",
+        }
+        if audit_error:
+            out["auditError"] = audit_error
+        return True, out
 
     async def tool_list_dir(self, args: dict):
         from fsops import FileOpError, local_list, sftp_list

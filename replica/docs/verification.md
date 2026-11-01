@@ -2449,3 +2449,116 @@ grep -c "async def tool_" backend/ai.py                                         
 - 不抓取 HTML 搜索结果、不做结果缓存、不做跨轮次去重；结果只按本次调用返回。
 - 端点由用户配置，模型只能控制查询词与域名过滤，不能改变目标主机；因此审批卡片
   展示的是端点主机名而非完整 URL。
+
+---
+
+## 37. 资产 CRUD 工具化（方向 D，2026-11-01）
+
+把本地资产树的增删改查暴露给通用 Agent。**本轮按用户明确决策：密钥不做脱敏，可明文
+返回、展示与传输**；其余约束（独立工具/审批、白名单、删除确认、审计、校验）保持。
+
+### 37.1 代码变更
+
+| 文件 | 变更 |
+|---|---|
+| `backend/ai.py` | `TOOLS` 26 → 33（+7 个 `asset_*`）；新增 `AssetArgError` 与校验/路径/摘要/审计 helper；`ChatRunner` 新增 7 个 handler、`_asset_audit`、`_asset_restore`；`SYSTEM_PROMPT` 增加资产 CRUD 与密钥明文读写说明 |
+| `scripts/test_ai.py` | `TOOLS` 断言 26 → 33；新增 `asset_validation_tests()`（7 条进程内）与 `asset_crud_tests(prefix)`（38 条 mock 端到端）；主流程插入两组用例 |
+| `README.md` | 目录树/工具表 26 → 33；§5.5 补资产 CRUD 审批矩阵、密钥明文策略、删除与审计说明 |
+| `docs/feature-matrix.csv` | 工具计数改 33；新增“工具-资产 CRUD”“工具-资产密钥”两行；审批策略行补 6 个 kind |
+| `docs/completion-audit.csv` | 行 76 改 33 并补资产工具；行 77 补资产审批 |
+| `docs/verification.md` | 本节（§37） |
+
+不修改 `store.py`、`app.py`、数据库 schema、前端 dist；不重构流式解析与审批框架。
+
+### 37.2 工具与审批矩阵
+
+| 工具 | 参数要点 | 审批 kind | 关键约束 |
+|---|---|---|---|
+| `asset_get` | `asset_id`、`include_children` | 无（只读） | 只返回非密钥 `config` 与 `secretFields` 字段名；>20 KB 配置返回 `configOmitted` |
+| `asset_create` | `type`(名称/0-21)、`name`、`parent_id`、`alias`、`color`、`config`、`allow_duplicate` | `asset_create` | config 含密钥 → `secret_in_config`；同父同名默认拒绝 |
+| `asset_update` | `asset_id`、`name`/`alias`/`color`/`config` | `asset_update` | 传 `parent_id` → `use_asset_move`；传 `type` 拒绝；空补丁 `no_changes` |
+| `asset_move` | `asset_id`、`parent_id`(null=根)、`before_id` | `asset_move` | 目标必须 `Dir`；自身/成环 → `asset_cycle` |
+| `asset_delete` | `asset_id`、`recursive`、`confirm` | `asset_delete` | 非空未 recursive → `asset_not_empty`；未 confirm → `confirmation_required`（均不弹审批）；审批详情含数量+名称（单个名称截 60 字符、最多 20 个） |
+| `asset_secret_read` | `asset_id`、`fields[]` | `asset_secret_read` | 字段叶子必须在 `SECRET_KEYS`；**明文返回**字段名/是否存在/长度/值（>32K 字符截断并标记） |
+| `asset_secret_write` | `asset_id`、`set{}`、`clear[]` | `asset_secret_write` | 白名单点路径；空值必须用 `clear`；`set`/`clear` 不相交；单值 ≤8 KB、单次 ≤20 字段 |
+
+6 个 kind 在 `_silent()` 中均落默认分支 `False` → **始终审批**，不继承静默策略；
+`asset_get` 不调用 `_require`。删除详情额外提示：“勾选本会话记住后，本轮后续
+`asset_delete` 不再弹审批”。`remembered` 挂在每条消息新建的 `ChatRunner` 上，故实际只
+影响本轮 AI 回复。
+
+### 37.3 密钥生命周期（明文策略）
+
+- 读：`asset_get` 不含值（仅字段名）；`asset_secret_read` 是唯一读取明文值的入口，
+  单独审批，审批卡片展示前 500 字符明文预览。
+- 写：`asset_secret_write` 的 `set` 值随 `tool_start` 事件与审批卡片明文展示、随
+  `tool_result` 之外的消息链路传输；工具输出只回 `{field,length}`，不回显值。
+- `config` 中任何层级出现 `SECRET_KEYS` 叶子一律拒绝（`secret_in_config`），密钥只能走
+  专用工具；`clear` 使用 store 既有的 `"__CLEAR__"` 语义，不改存储层。
+- 审计：`history.detail` 只记字段名与字节数（`password(22B)`），不记值；资产列表
+  `GET /api/assets` 仍返回剥除 config 的视图（既有行为），测试断言其中不含测试密钥。
+- 持久化：chat 只存 user 原文与最终 assistant 文本；mock 会把工具结果回显进最终文本，
+  因此本轮允许的明文密钥可能随模型回答进入 chat 历史（用户已知情并授权）。
+
+### 37.4 删除确认与失败回滚
+
+- 删除采用 **`confirm` 参数 + 单次审批**（不做双审批，避免越记越多）；预检在审批前
+  完成，返回结构化错误与受影响名称。
+- `store.delete_asset` 为单条 `DELETE ... IN (...) + commit`，全有或全无；**不做快照**：
+  `import_assets` 会重分配 id、断开会话/历史引用，`export_assets` 会落盘明文秘密。
+  因此删除不可撤销，README 与审批详情均已写明。
+- `update` / `move` / `secret_write` 在内存保存变更前快照（含旧密钥，仅存活于本次调用栈），
+  失败时用 `update_asset` 回写名称/别名/颜色/config/父节点/sort；仍失败返回
+  `asset_rollback_failed` 语义的 `rollback=failed:*`。快照不落盘、不进日志、用完即释放。
+- 审计写入失败不影响已完成的变更，输出 `audit: "failed"` + 错误类型。
+- 未改数据库 schema，无迁移。
+
+### 37.5 测试与证据
+
+```
+cd replica
+python3 scripts/test_ai.py --base http://127.0.0.1:38110 2>&1 | tee /tmp/h1khub-test_ai.log
+# PASS=118 FAIL=0（其中新增资产相关断言 46 条：7 条进程内 + 39 条端到端）
+```
+
+覆盖（全部本地 mock LLM，无真实 SSH/DB/Docker/外网）：
+
+- 进程内（7）：类型名/id 映射、非法类型、密钥点路径白名单、嵌套密钥路径、config
+  拒绝密钥、颜色校验、名称控制字符。
+- 端到端（39）：create 批准/拒绝/非法类型/config 含密钥/同父重名；get 无审批/子节点/
+  秘密字段名；secret_write 批准/拒绝/未知字段/落库验证（`/api/assets-export`）/审批与
+  事件明文；secret_read 明文/拒绝；update 批准/拒绝/父目录拒绝/字段生效；move 批准/
+  成环拒绝；delete 非空拒绝/未确认拒绝/拒绝执行/批准（3 个资产）/审批详情数量与名称/
+  树已删除；history 记录且不含密钥值；`GET /api/assets` 不含密钥；Terminal 子集不可见
+  资产工具；`finally` 两次按前缀清理并断言无残留。
+- 回归：流式对话、shell 审批/拒绝、FTP 全写操作、Docker 动作、SCP、隧道、SQL/Terminal
+  模式全部保持 PASS。
+
+### 37.6 文档计数同步（26 → 33）
+
+| 位置 | 现值 |
+|---|---|
+| `README.md:187`（目录树） | 33 个工具 |
+| `README.md:317`（AI Agent 能力表） | 33 个（补资产 CRUD 与密钥读写） |
+| `README.md:397`（审批说明） | 补 7 工具/6 kind、删除确认、密钥明文与审计边界 |
+| `docs/feature-matrix.csv:72` | 33 个工具；新增“工具-资产 CRUD”“工具-资产密钥”行 |
+| `docs/completion-audit.csv:77` | AI 工具 33 个（含资产 CRUD/密钥） |
+| `scripts/test_ai.py:246` | 断言 `TOOLS = 33` 且与 handler 集合一致 |
+| `docs/verification.md` | 本节（§37） |
+
+核对命令：
+
+```
+python3 -c "import sys;sys.path.insert(0,'backend');import ai;print(len(ai.TOOLS))"   # → 33
+grep -c "async def tool_" backend/ai.py                                              # → 33
+```
+
+### 37.7 边界与未做
+
+- 资产工具不纳入 Terminal / SQL 助手子集；`list_assets` 行为不变。
+- `asset_get` 只返回非密钥 config；密钥值只能通过 `asset_secret_read`（审批）获取。
+- `SECRET_KEYS` 之外的键不会被识别为密钥；这是既有数据模型边界，本轮未扩白名单。
+- 密钥明文是本轮用户决策：WS 事件、审批卡片、模型上下文都可能出现明文；chat 历史也
+  可能因模型回显而保留明文。审计（history）仅记元信息。
+- 列表嵌套的密钥（如 `items[0].password`）不可通过点路径工具寻址/写入。
+- 删除不可撤销；`asset_delete` 单次最多影响 5000 个资产，超出直接拒绝。

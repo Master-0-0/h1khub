@@ -243,8 +243,8 @@ def docker_action_stub_tests() -> None:
     names = [tool["name"] for tool in ai.TOOLS]
     handlers = {name[5:] for name in dir(ai.ChatRunner) if name.startswith("tool_")}
     check(
-        "ai: TOOLS = 26 and handlers match",
-        len(names) == 26 and set(names) == handlers,
+        "ai: TOOLS = 33 and handlers match",
+        len(names) == 33 and set(names) == handlers,
         f"count={len(names)} orphan={sorted(set(names) ^ handlers)}",
     )
 
@@ -613,6 +613,378 @@ def start_search_stub():
     return server, thread, hits
 
 
+def approval_kinds(result: dict) -> list[str]:
+    return [event.get("kind") for event in result.get("events") or [] if event.get("type") == "approval"]
+
+
+def tool_output(result: dict) -> str:
+    return ((result.get("toolResults") or [{}])[0].get("output")) or ""
+
+
+def tool_json(result: dict) -> dict:
+    try:
+        return json.loads(tool_output(result) or "{}")
+    except json.JSONDecodeError:
+        return {}
+
+
+def asset_by_name(name: str) -> dict | None:
+    assets = (data_of(req("/api/assets", method="GET")) or {}).get("assets") or []
+    return next((item for item in assets if item.get("name") == name), None)
+
+
+def asset_export_config(asset_id: str) -> dict:
+    payload = req(f"/api/assets-export?ids={urllib.parse.quote(asset_id)}", method="GET")
+    if not isinstance(payload, dict):
+        return {}
+    asset = next((item for item in payload.get("assets") or [] if item.get("id") == asset_id), {})
+    return asset.get("config") or {}
+
+
+def asset_validation_tests() -> None:
+    """In-process checks for the asset validation helpers (no HTTP, no assets)."""
+    backend = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "backend")
+    if backend not in sys.path:
+        sys.path.insert(0, backend)
+    import ai
+
+    def expect(code: str, fn) -> bool:
+        try:
+            fn()
+        except ai.AssetArgError as exc:
+            return exc.code == code
+        return False
+
+    check("ai: asset type by name", ai._asset_type_id("SSH") == 2 and ai._asset_type_id("Dir") == 0)
+    check("ai: asset type invalid rejected", expect("invalid_type", lambda: ai._asset_type_id("Nope")))
+    check("ai: asset secret path whitelist", expect("invalid_secret_field", lambda: ai._asset_secret_path("host")))
+    check("ai: asset secret nested path accepted", ai._asset_secret_path("proxy.password") == "proxy.password")
+    check("ai: asset config rejects secrets", expect("secret_in_config", lambda: ai._asset_config({"password": "x"})))
+    check(
+        "ai: asset color validation",
+        ai._asset_color("#Ab12Cd") == "#ab12cd" and expect("invalid_color", lambda: ai._asset_color("red")),
+    )
+    check(
+        "ai: asset name rejects control chars",
+        expect("invalid_name", lambda: ai._asset_text("a\x01b", "name", 200, required=True)),
+    )
+
+
+def asset_crud_tests(prefix: str) -> None:
+    """Mock-LLM E2E for asset CRUD, approvals, delete confirmation and secrets.
+
+    Everything stays local: the mock LLM drives tool calls, assets live in the
+    local SQLite store, and the probe tree is removed in `finally` even when a
+    check fails. Plaintext secrets are intentional (user policy), so the test
+    proves they round-trip and that the read-only asset list stays config-free.
+    """
+    dir_name = f"{prefix}-dir"
+    child_name = f"{prefix}-ssh"
+    dir2_name = f"{prefix}-dir2"
+    sub_name = f"{prefix}-sub"
+    secret = f"H1K-secret-{prefix}"
+    ids: set[str] = set()
+    try:
+        created = asyncio.run(run_chat(f'@tool asset_create {{"type":"Dir","name":"{dir_name}"}}'))
+        dir_id = tool_json(created).get("id")
+        ids.add(dir_id)
+        check(
+            "ai: asset_create approved",
+            created["approvals"] == 1 and bool(dir_id),
+            tool_output(created),
+        )
+        check("ai: asset_create kind", approval_kinds(created) == ["asset_create"], str(approval_kinds(created)))
+        check("ai: asset_create visible in list", asset_by_name(dir_name) is not None)
+
+        rejected = asyncio.run(run_chat(f'@tool asset_create {{"type":"Dir","name":"{prefix}-rejected"}}', approve=False))
+        check(
+            "ai: asset_create rejected",
+            (rejected["toolResults"] or [{}])[0].get("ok") is False
+            and asset_by_name(f"{prefix}-rejected") is None,
+            tool_output(rejected),
+        )
+
+        invalid = asyncio.run(run_chat(f'@tool asset_create {{"type":"Nope","name":"{prefix}-bad"}}'))
+        check(
+            "ai: asset_create invalid type before approval",
+            "invalid_type" in tool_output(invalid) and invalid["approvals"] == 0,
+            tool_output(invalid),
+        )
+
+        bad_config = asyncio.run(
+            run_chat(f'@tool asset_create {{"type":"SSH","name":"{prefix}-sec","config":{{"password":"x"}}}}')
+        )
+        check(
+            "ai: asset_create rejects config secrets",
+            "secret_in_config" in tool_output(bad_config) and bad_config["approvals"] == 0,
+            tool_output(bad_config),
+        )
+
+        child = asyncio.run(
+            run_chat(
+                f'@tool asset_create {{"type":"SSH","name":"{child_name}","parent_id":"{dir_id}",'
+                f'"config":{{"host":"10.0.0.9","port":22,"username":"probe"}}}}'
+            )
+        )
+        child_id = tool_json(child).get("id")
+        ids.add(child_id)
+        check("ai: asset_create child ok", bool(child_id), tool_output(child))
+
+        duplicate = asyncio.run(
+            run_chat(f'@tool asset_create {{"type":"SSH","name":"{child_name}","parent_id":"{dir_id}"}}')
+        )
+        check(
+            "ai: asset_create duplicate rejected",
+            "duplicate_name" in tool_output(duplicate) and duplicate["approvals"] == 0,
+            tool_output(duplicate),
+        )
+
+        got = asyncio.run(run_chat(f'@tool asset_get {{"asset_id":"{dir_id}","include_children":true}}'))
+        got_out = tool_json(got)
+        check("ai: asset_get no approval", got["approvals"] == 0, str(got["approvals"]))
+        check(
+            "ai: asset_get children + secrets stripped",
+            got_out.get("childCount") == 1 and got_out.get("secretFields") == [],
+            tool_output(got),
+        )
+
+        write = asyncio.run(
+            run_chat(f'@tool asset_secret_write {{"asset_id":"{child_id}","set":{{"password":"{secret}"}}}}')
+        )
+        write_out = tool_json(write)
+        check(
+            "ai: asset_secret_write approved",
+            write_out.get("ok") is True and write["approvals"] == 1,
+            tool_output(write),
+        )
+        check("ai: asset_secret_write kind", approval_kinds(write) == ["asset_secret_write"], str(approval_kinds(write)))
+        check(
+            "ai: asset_secret_write plaintext in approval",
+            secret in json.dumps(write["events"], ensure_ascii=False),
+            "approval/tool_start lacks plaintext",
+        )
+        check(
+            "ai: asset_secret_write persisted",
+            asset_export_config(child_id).get("password") == secret,
+            str(asset_export_config(child_id))[:200],
+        )
+
+        rejected_write = asyncio.run(
+            run_chat(
+                f'@tool asset_secret_write {{"asset_id":"{child_id}","set":{{"password":"{prefix}-nope"}}}}',
+                approve=False,
+            )
+        )
+        check(
+            "ai: asset_secret_write rejected keeps value",
+            (rejected_write["toolResults"] or [{}])[0].get("ok") is False
+            and asset_export_config(child_id).get("password") == secret,
+            tool_output(rejected_write),
+        )
+
+        bad_field = asyncio.run(
+            run_chat(f'@tool asset_secret_write {{"asset_id":"{child_id}","set":{{"api_token":"x"}}}}')
+        )
+        check(
+            "ai: asset_secret_write unknown field rejected",
+            "invalid_secret_field" in tool_output(bad_field) and bad_field["approvals"] == 0,
+            tool_output(bad_field),
+        )
+
+        read = asyncio.run(
+            run_chat(f'@tool asset_secret_read {{"asset_id":"{child_id}","fields":["password"]}}')
+        )
+        read_fields = tool_json(read).get("fields") or []
+        check(
+            "ai: asset_secret_read returns plaintext",
+            read["approvals"] == 1
+            and bool(read_fields)
+            and read_fields[0].get("value") == secret
+            and read_fields[0].get("length") == len(secret.encode("utf-8")),
+            tool_output(read),
+        )
+        check("ai: asset_secret_read kind", approval_kinds(read) == ["asset_secret_read"], str(approval_kinds(read)))
+
+        read_rejected = asyncio.run(run_chat(f'@tool asset_secret_read {{"asset_id":"{child_id}"}}', approve=False))
+        check(
+            "ai: asset_secret_read rejected",
+            (read_rejected["toolResults"] or [{}])[0].get("ok") is False
+            and "拒绝" in tool_output(read_rejected),
+            tool_output(read_rejected),
+        )
+
+        listed_json = json.dumps(data_of(req("/api/assets", method="GET")) or {}, ensure_ascii=False)
+        check("ai: asset list interface keeps secrets out of config", secret not in listed_json)
+
+        updated = asyncio.run(
+            run_chat(
+                f'@tool asset_update {{"asset_id":"{child_id}","alias":"probe-alias",'
+                f'"color":"#112233","config":{{"host":"10.0.0.10"}}}}'
+            )
+        )
+        check(
+            "ai: asset_update approved",
+            tool_json(updated).get("id") == child_id and updated["approvals"] == 1,
+            tool_output(updated),
+        )
+        check("ai: asset_update kind", approval_kinds(updated) == ["asset_update"], str(approval_kinds(updated)))
+        after_update = tool_json(asyncio.run(run_chat(f'@tool asset_get {{"asset_id":"{child_id}"}}')))
+        check(
+            "ai: asset_update applied",
+            after_update.get("alias") == "probe-alias"
+            and (after_update.get("config") or {}).get("host") == "10.0.0.10"
+            and after_update.get("color") == "#112233",
+            str(after_update)[:300],
+        )
+
+        update_rejected = asyncio.run(
+            run_chat(f'@tool asset_update {{"asset_id":"{child_id}","alias":"nope-alias"}}', approve=False)
+        )
+        after_reject = tool_json(asyncio.run(run_chat(f'@tool asset_get {{"asset_id":"{child_id}"}}')))
+        check(
+            "ai: asset_update rejected keeps value",
+            (update_rejected["toolResults"] or [{}])[0].get("ok") is False
+            and after_reject.get("alias") == "probe-alias",
+            tool_output(update_rejected),
+        )
+
+        parent_patch = asyncio.run(
+            run_chat(f'@tool asset_update {{"asset_id":"{child_id}","parent_id":"{dir_id}"}}')
+        )
+        check(
+            "ai: asset_update rejects parent change",
+            "use_asset_move" in tool_output(parent_patch) and parent_patch["approvals"] == 0,
+            tool_output(parent_patch),
+        )
+
+        dir2 = asyncio.run(run_chat(f'@tool asset_create {{"type":"Dir","name":"{dir2_name}"}}'))
+        dir2_id = tool_json(dir2).get("id")
+        ids.add(dir2_id)
+        sub = asyncio.run(
+            run_chat(f'@tool asset_create {{"type":"Dir","name":"{sub_name}","parent_id":"{dir2_id}"}}')
+        )
+        sub_id = tool_json(sub).get("id")
+        ids.add(sub_id)
+        check("ai: asset_create second tree ok", bool(dir2_id and sub_id), tool_output(dir2) + tool_output(sub))
+
+        moved = asyncio.run(run_chat(f'@tool asset_move {{"asset_id":"{child_id}","parent_id":"{dir2_id}"}}'))
+        check(
+            "ai: asset_move approved",
+            moved["approvals"] == 1 and tool_json(moved).get("parentId") == dir2_id,
+            tool_output(moved),
+        )
+        check("ai: asset_move kind", approval_kinds(moved) == ["asset_move"], str(approval_kinds(moved)))
+
+        cycle = asyncio.run(run_chat(f'@tool asset_move {{"asset_id":"{dir2_id}","parent_id":"{sub_id}"}}'))
+        check(
+            "ai: asset_move cycle rejected",
+            "asset_cycle" in tool_output(cycle) and cycle["approvals"] == 0,
+            tool_output(cycle),
+        )
+
+        non_empty = asyncio.run(run_chat(f'@tool asset_delete {{"asset_id":"{dir2_id}"}}'))
+        check(
+            "ai: asset_delete non-empty rejected",
+            "asset_not_empty" in tool_output(non_empty) and non_empty["approvals"] == 0,
+            tool_output(non_empty),
+        )
+
+        unconfirmed = asyncio.run(
+            run_chat(f'@tool asset_delete {{"asset_id":"{dir2_id}","recursive":true}}')
+        )
+        unconfirmed_out = tool_json(unconfirmed).get("error") or {}
+        check(
+            "ai: asset_delete requires confirm",
+            "confirmation_required" in tool_output(unconfirmed)
+            and unconfirmed_out.get("count") == 3
+            and len(unconfirmed_out.get("names") or []) == 3
+            and unconfirmed["approvals"] == 0,
+            tool_output(unconfirmed),
+        )
+
+        delete_rejected = asyncio.run(
+            run_chat(
+                f'@tool asset_delete {{"asset_id":"{dir2_id}","recursive":true,"confirm":true}}',
+                approve=False,
+            )
+        )
+        check(
+            "ai: asset_delete rejected",
+            (delete_rejected["toolResults"] or [{}])[0].get("ok") is False
+            and asset_by_name(dir2_name) is not None,
+            tool_output(delete_rejected),
+        )
+
+        deleted = asyncio.run(
+            run_chat(f'@tool asset_delete {{"asset_id":"{dir2_id}","recursive":true,"confirm":true}}')
+        )
+        approval = next((event for event in deleted["events"] if event.get("type") == "approval"), {})
+        detail = approval.get("detail") or {}
+        check(
+            "ai: asset_delete approved",
+            tool_json(deleted).get("deletedCount") == 3 and deleted["approvals"] == 1,
+            tool_output(deleted),
+        )
+        check(
+            "ai: asset_delete approval lists affected",
+            detail.get("count") == 3 and len(detail.get("names") or []) == 3,
+            str(detail)[:300],
+        )
+        check("ai: asset_delete kind", approval_kinds(deleted) == ["asset_delete"], str(approval_kinds(deleted)))
+        check(
+            "ai: asset_delete removed tree",
+            asset_by_name(dir2_name) is None
+            and asset_by_name(sub_name) is None
+            and asset_by_name(child_name) is None,
+        )
+
+        history = (data_of(req("/api/history?limit=100", method="GET")) or {}).get("history") or []
+        probe_history = [
+            row
+            for row in history
+            if (row.get("asset_id") in ids)
+            or any(name in (row.get("title") or "") for name in (dir_name, child_name, dir2_name, sub_name))
+        ]
+        check(
+            "ai: asset history recorded",
+            any("asset_create" in (row.get("detail") or "") for row in probe_history)
+            and any(row.get("kind") == "asset-delete" for row in probe_history),
+            str(probe_history)[:400],
+        )
+        check(
+            "ai: asset history stores no secret value",
+            secret not in json.dumps(probe_history, ensure_ascii=False),
+            "secret leaked into history",
+        )
+
+        terminal = asyncio.run(
+            run_chat(f'@tool asset_get {{"asset_id":"{dir_id}"}}', assistant="terminal", sessionId="")
+        )
+        check(
+            "ai: terminal mode hides asset tools",
+            not any((item.get("name") or "").startswith("asset_") for item in terminal["toolStarts"]),
+            str(terminal["toolStarts"])[:200],
+        )
+    finally:
+        for _ in range(2):
+            try:
+                assets = (data_of(req("/api/assets", method="GET")) or {}).get("assets") or []
+                for asset in assets:
+                    if (asset.get("name") or "").startswith(prefix):
+                        req(f"/api/assets/{asset['id']}", method="DELETE")
+            except Exception:
+                pass
+        try:
+            left = [
+                asset["name"]
+                for asset in ((data_of(req("/api/assets", method="GET")) or {}).get("assets") or [])
+                if (asset.get("name") or "").startswith(prefix)
+            ]
+            check("ai: asset probe cleanup", not left, str(left))
+        except Exception as exc:
+            check("ai: asset probe cleanup", False, str(exc))
+
+
 def main() -> int:
     global BASE, TOKEN, ORIGINAL_AI
     parser = argparse.ArgumentParser()
@@ -929,6 +1301,12 @@ def main() -> int:
             req("/api/settings", {"websearch": ORIGINAL_WEBSEARCH}, method="PUT")
             search_server.shutdown()
             search_server.server_close()
+
+        print("\n[asset validation]")
+        asset_validation_tests()
+
+        print("\n[asset crud + secrets]")
+        asset_crud_tests(f"asset-probe-{suffix}")
 
         print("\n[tool: scp upload/download]")
         up = asyncio.run(run_chat(f'@tool scp_upload {{"asset_id":"{ssh_id}","local_path":"{local_up}","remote_path":"{remote}"}}'))

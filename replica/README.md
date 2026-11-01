@@ -184,7 +184,7 @@ python3 scripts/seed_demo.py --reset-settings
 │  ├─ key_svc.py   密钥生成、ssh-copy-id（公钥追加）                              │
 │  ├─ redis_svc.py Redis 键空间、类型化读写、批量操作、控制台、实时信息          │
 │  ├─ docker_svc.py Docker CLI（本地 socket / SSH / TCP）、Compose、容器文件     │
-│  ├─ ai.py        OpenAI 兼容 / Anthropic 流式对话 + 26 个工具 + 审批            │
+│  ├─ ai.py        OpenAI 兼容 / Anthropic 流式对话 + 33 个工具 + 审批            │
 │  └─ app.py       路由、鉴权、RPC、静态资源                                     │
 └───────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -314,7 +314,7 @@ python3 scripts/seed_demo.py --reset-settings
 | 供应商 | ✅ | OpenAI 兼容协议 + Anthropic Messages；内置 13 家预设 + 自定义 |
 | 模型目录 / 连通性测试 | ✅ | `/v1/models` 拉取、最小对话测试 |
 | 流式对话 | ✅ | SSE 解析、增量渲染、停止、token 统计 |
-| 工具 | ✅ | 26 个：资产、文件、目录、shell、SQL、Redis、Docker 容器/日志/启停、终端、SCP 上下行、隧道启停/列表、FTP 列目录/上传/下载/删除/重命名、网页抓取、联网搜索（websearch，需配置端点+审批） |
+| 工具 | ✅ | 33 个：资产（列/读/新建/修改/移动/删除 + 密钥读写）、文件、目录、shell、SQL、Redis、Docker 容器/日志/启停、终端、SCP 上下行、隧道启停/列表、FTP 列目录/上传/下载/删除/重命名、网页抓取、联网搜索（websearch，需配置端点+审批） |
 | 审批策略 | ✅ | 默认静默读/只读 SQL；写文件、命令、写 SQL 需审批；危险命令始终审批；可"本会话记住" |
 | 会话持久化 | ✅ | SQLite 中的 chat/messages，界面可新建、切换、删除 |
 | 专用助手 | ✅ | 通用 / Terminal 2.0（终端上下文+终端工具）/ SQL（数据库与 SQL 上下文+SQL 工具） |
@@ -398,6 +398,24 @@ WebSocket 帧为 JSON：
 - 危险命令（`rm`、`dd`、`mkfs`、`shutdown`、`sudo` 包装、管道执行等）即使开启"静默命令"也必须审批。
 - 审批结果可按"本会话记住"缓存；拒绝则工具返回"用户拒绝"。
 - 工具输出截断到 100 KB，避免把超大结果塞回模型。
+
+资产 CRUD（7 个工具）使用 6 个独立审批 kind，**始终审批**、不继承静默策略，也不纳入
+Terminal / SQL 助手子集：
+
+| 工具 | 审批 kind | 说明 |
+|---|---|---|
+| `asset_get` | 无（只读） | 返回非密钥配置与密钥字段名；不含密钥值与秘密 |
+| `asset_create` | `asset_create` | `config` 中出现密钥字段直接拒绝（`secret_in_config`），密钥须走 `asset_secret_write` |
+| `asset_update` | `asset_update` | 只改名称/别名/颜色/非密钥配置；改父目录用 `asset_move`，改类型直接拒绝 |
+| `asset_move` | `asset_move` | 目标必须是 `Dir`，禁止自身/成环（`asset_cycle`） |
+| `asset_delete` | `asset_delete` | 必须 `confirm=true`；非空目录还须 `recursive=true`，否则在审批前返回 `asset_not_empty` / `confirmation_required` 与受影响资产数量、名称 |
+| `asset_secret_read` | `asset_secret_read` | 字段必须在 `SECRET_KEYS` 白名单内；**按本轮策略明文返回**（字段名/是否存在/长度/值），审批卡片同样展示明文预览 |
+| `asset_secret_write` | `asset_secret_write` | 只接受白名单字段；空值用 `clear` 清除；明文值随工具事件/审批卡片展示与传输 |
+
+删除是单条 `DELETE ... IN (...)` 事务，天然全有或全无；但**不可撤销**：`export_assets` /
+`import_assets` 会重新分配 id 并断开会话/历史引用，且导出会落盘明文秘密，因此不做自动快照。
+每次变更都会写 `history`（`asset` / `asset-delete` / `asset-secret-read`），detail 记录操作者 `ai`、
+工具名、资产 id、变更字段与数量（密钥只记字段名与字节数，不写值）。
 
 联网搜索（`websearch`）默认关闭，**没有默认端点**；`settings.websearch.enabled=false` 或
 `endpoint` 为空时，工具只返回结构化错误（`websearch_disabled` / `websearch_not_configured`，
