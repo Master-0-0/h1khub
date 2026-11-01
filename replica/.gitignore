@@ -1,9 +1,0 @@
-node_modules/
-__pycache__/
-*.pyc
-*.log
-data.db
-secret.key
-known_hosts
-runtime.json
-.DS_Store
