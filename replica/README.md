@@ -184,7 +184,7 @@ python3 scripts/seed_demo.py --reset-settings
 │  ├─ key_svc.py   密钥生成、ssh-copy-id（公钥追加）                              │
 │  ├─ redis_svc.py Redis 键空间、类型化读写、批量操作、控制台、实时信息          │
 │  ├─ docker_svc.py Docker CLI（本地 socket / SSH / TCP）、Compose、容器文件     │
-│  ├─ ai.py        OpenAI 兼容 / Anthropic 流式对话 + 25 个工具 + 审批            │
+│  ├─ ai.py        OpenAI 兼容 / Anthropic 流式对话 + 26 个工具 + 审批            │
 │  └─ app.py       路由、鉴权、RPC、静态资源                                     │
 └───────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -314,7 +314,7 @@ python3 scripts/seed_demo.py --reset-settings
 | 供应商 | ✅ | OpenAI 兼容协议 + Anthropic Messages；内置 13 家预设 + 自定义 |
 | 模型目录 / 连通性测试 | ✅ | `/v1/models` 拉取、最小对话测试 |
 | 流式对话 | ✅ | SSE 解析、增量渲染、停止、token 统计 |
-| 工具 | ✅ | 25 个：资产、文件、目录、shell、SQL、Redis、Docker 容器/日志/启停、终端、SCP 上下行、隧道启停/列表、FTP 列目录/上传/下载/删除/重命名、网页抓取 |
+| 工具 | ✅ | 26 个：资产、文件、目录、shell、SQL、Redis、Docker 容器/日志/启停、终端、SCP 上下行、隧道启停/列表、FTP 列目录/上传/下载/删除/重命名、网页抓取、联网搜索（websearch，需配置端点+审批） |
 | 审批策略 | ✅ | 默认静默读/只读 SQL；写文件、命令、写 SQL 需审批；危险命令始终审批；可"本会话记住" |
 | 会话持久化 | ✅ | SQLite 中的 chat/messages，界面可新建、切换、删除 |
 | 专用助手 | ✅ | 通用 / Terminal 2.0（终端上下文+终端工具）/ SQL（数据库与 SQL 上下文+SQL 工具） |
@@ -394,10 +394,27 @@ WebSocket 帧为 JSON：
 }
 ```
 
-- 只读操作直接执行；写文件、shell、写 SQL、写 Redis 命令、Docker 容器启停/重启、FTP 上传/下载/删除/重命名会阻塞并弹出审批卡片（Docker 与 FTP 写操作使用独立审批 kind，不受静默策略影响）。
+- 只读操作直接执行；写文件、shell、写 SQL、写 Redis 命令、Docker 容器启停/重启、FTP 上传/下载/删除/重命名、联网搜索会阻塞并弹出审批卡片（Docker、FTP 写操作与联网搜索使用独立审批 kind，不受静默策略影响）。
 - 危险命令（`rm`、`dd`、`mkfs`、`shutdown`、`sudo` 包装、管道执行等）即使开启"静默命令"也必须审批。
 - 审批结果可按"本会话记住"缓存；拒绝则工具返回"用户拒绝"。
 - 工具输出截断到 100 KB，避免把超大结果塞回模型。
+
+联网搜索（`websearch`）默认关闭，**没有默认端点**；`settings.websearch.enabled=false` 或
+`endpoint` 为空时，工具只返回结构化错误（`websearch_disabled` / `websearch_not_configured`，
+语义 501），不会发起任何 DNS/HTTP 请求。可在「设置 → Agent → 联网搜索」启用并填写端点，
+或调用本机 API：
+
+```http
+PUT /api/settings
+{"websearch": {"enabled": true, "endpoint": "https://searx.example/search?q={query}&format=json", "timeoutSeconds": 15, "maxResults": 8}}
+```
+
+端点约定：GET，返回 `{"results":[{"title","url","snippet"}]}`（也接受裸数组 / `items` / `data`）；
+`{query}` 做 URL 编码替换，未包含占位符时自动追加 `q=`。单次响应最多读取 1 MB，默认 15 s 超时
+（1–30 s），标题/摘要分别截断到 300/1000 字符；`allowed_domains` / `blocked_domains` 可按域名过滤。
+联网搜索使用独立审批 kind `websearch`，不继承静默策略；**不内置 DuckDuckGo 或 `api.hexhub.cn` 回退**
+（原版 `NewWebSearchTool` 抓 DuckDuckGo HTML，默认云地址仅作为逆向资料记录）。该工具不纳入
+Terminal / SQL 助手子集。
 
 ### 5.6 资产地图
 
@@ -605,7 +622,7 @@ replica/
 - Chrome 服务器代理：SSH 资产右键启动本机 Chrome，SOCKS5 实际转发、临时配置、退出/停止自动回收、未安装 Chrome 的 400、右键菜单与管理对话框 ✅（`scripts/test_chromeproxy.py` PASS=75 FAIL=0）；**3 跳 SSH 链 + 真实 Chromium** 页面加载、每跳新增认证、窗口截图 ✅（`scripts/test_chromeproxy_jumps.py` PASS=23 FAIL=0）
 - Docker：Compose、容器文件、创建/重命名/pause/top、本地/SSH/TCP 容器终端 ✅
 - Redis：SCAN、类型读写、批量删除/重命名/设置值/TTL、控制台、实时信息 ✅
-- AI：本地 mock 的流式工具调用 + 审批允许/拒绝 + SCP/隧道/FTP 全操作/Docker 容器启停工具 ✅
+- AI：本地 mock 的流式工具调用 + 审批允许/拒绝 + SCP/隧道/FTP 全操作/Docker 容器启停/联网搜索工具 ✅
 - 安全：无令牌 401、敏感字段不回传、DB 文件中无明文口令、权限 0600/0700 ✅
 - 锁屏：PBKDF2 哈希 + 随机 salt、失败退避、立即/空闲锁定、刷新/新标签仍锁定、`data.db` 无明文口令（`test_lock.py` PASS=50）✅
 - UI：无头 Chromium 全流程无 console error ✅

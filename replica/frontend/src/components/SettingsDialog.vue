@@ -285,6 +285,7 @@ function initEmptyDraft() {
   const settings = clone(state.settings)
   Object.assign(draft, settings)
   if (!Array.isArray(draft.ai?.providers)) draft.ai = { ...(draft.ai || {}), providers: [] }
+  if (!draft.websearch) draft.websearch = { enabled: false, endpoint: '', timeoutSeconds: 15, maxResults: 8 }
 }
 initEmptyDraft()
 
@@ -314,6 +315,7 @@ function resetDraft() {
   Object.keys(draft).forEach((k) => delete draft[k])
   Object.assign(draft, settings)
   if (!Array.isArray(draft.ai?.providers)) draft.ai = { ...(draft.ai || {}), providers: [] }
+  if (!draft.websearch) draft.websearch = { enabled: false, endpoint: '', timeoutSeconds: 15, maxResults: 8 }
 }
 
 watch(
@@ -714,6 +716,26 @@ function setActiveProvider(id) {
             <div class="settings-row">
               <div><div class="label">{{ t('最大工具轮次', 'Max tool rounds') }}</div></div>
               <div class="control"><input v-model.number="draft.agent.maxToolRounds" type="number" min="1" max="40" class="input" /></div>
+            </div>
+
+            <h3 style="margin-top: 18px">{{ t('联网搜索（websearch）', 'Web search (websearch)') }}</h3>
+            <div class="alert info">{{ t('默认关闭且没有默认端点：关闭或端点为空时，Agent 不会发起任何 DNS/HTTP 请求，只返回结构化错误。复刻版不内置 DuckDuckGo 或 api.hexhub.cn 回退。', 'Off by default with no default endpoint: while disabled or unconfigured the agent makes no DNS/HTTP request and only returns a structured error. This build has no DuckDuckGo or api.hexhub.cn fallback.') }}</div>
+            <div class="settings-row">
+              <div><div class="label">{{ t('启用联网搜索', 'Enable web search') }}</div><div class="desc">{{ t('每次调用仍需审批', 'Each call still requires approval') }}</div></div>
+              <div class="control"><span class="switch" :class="{ on: draft.websearch.enabled }" @click="draft.websearch.enabled = !draft.websearch.enabled" /></div>
+            </div>
+            <div class="field">
+              <label>{{ t('搜索端点（JSON）', 'Search endpoint (JSON)') }}</label>
+              <input v-model="draft.websearch.endpoint" class="input mono" :placeholder="t('https://searx.example/search?q={query}&format=json', 'https://searx.example/search?q={query}&format=json')" />
+              <div class="tiny" style="margin-top: 4px">{{ t('GET 返回 {"results":[{"title","url","snippet"}]}；{query} 会被 URL 编码，未包含占位符时自动追加 q=。端点会原样保存在本机设置中，不要把长期密钥放进 URL。', 'GET returns {"results":[{"title","url","snippet"}]}; {query} is URL-encoded, otherwise q= is appended. The endpoint is stored as-is locally: do not put long-lived secrets in the URL.') }}</div>
+            </div>
+            <div class="settings-row">
+              <div><div class="label">{{ t('超时（秒）', 'Timeout (seconds)') }}</div><div class="desc">{{ t('范围 1–30，默认 15', 'Range 1–30, default 15') }}</div></div>
+              <div class="control"><input v-model.number="draft.websearch.timeoutSeconds" type="number" min="1" max="30" class="input" /></div>
+            </div>
+            <div class="settings-row">
+              <div><div class="label">{{ t('最多结果', 'Max results') }}</div><div class="desc">{{ t('范围 1–10，默认 8', 'Range 1–10, default 8') }}</div></div>
+              <div class="control"><input v-model.number="draft.websearch.maxResults" type="number" min="1" max="10" class="input" /></div>
             </div>
           </div>
 

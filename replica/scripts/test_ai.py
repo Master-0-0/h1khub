@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import http.server
 import json
 import os
 import random
@@ -19,11 +20,14 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import aiohttp
+from aiohttp import web
 
 BASE = "http://127.0.0.1:38110"
 MOCK_PORT = 39001
@@ -239,8 +243,8 @@ def docker_action_stub_tests() -> None:
     names = [tool["name"] for tool in ai.TOOLS]
     handlers = {name[5:] for name in dir(ai.ChatRunner) if name.startswith("tool_")}
     check(
-        "ai: TOOLS = 25 and handlers match",
-        len(names) == 25 and set(names) == handlers,
+        "ai: TOOLS = 26 and handlers match",
+        len(names) == 26 and set(names) == handlers,
         f"count={len(names)} orphan={sorted(set(names) ^ handlers)}",
     )
 
@@ -303,6 +307,298 @@ def docker_action_stub_tests() -> None:
     )
 
 
+def websearch_stub_tests() -> None:
+    """Hermetic websearch coverage against a local JSON search stub.
+
+    Proves the degradation contract end to end at the handler layer: disabled
+    and unconfigured settings make zero requests, rejection never touches the
+    network, and an approved call parses/filters/truncates local stub results.
+    """
+    backend = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "backend")
+    if backend not in sys.path:
+        sys.path.insert(0, backend)
+    import ai
+
+    hits = {"count": 0, "queries": []}
+    long_snippet = "长摘要" * 700
+
+    async def handler(request):
+        hits["count"] += 1
+        hits["queries"].append(request.query.get("q") or "")
+        kind = request.match_info["kind"]
+        if kind == "slow":
+            await asyncio.sleep(2)
+            return web.json_response({"results": []})
+        if kind == "error":
+            return web.Response(status=500, text="boom")
+        if kind == "bad":
+            return web.Response(text="<html>not json</html>", content_type="text/html")
+        return web.json_response(
+            {
+                "results": [
+                    {"title": "Allowed A", "url": "https://allowed.example/a", "snippet": long_snippet},
+                    {"title": "Blocked B", "url": "https://blocked.example/b", "snippet": "blocked"},
+                    {"title": "Allowed C", "url": "https://allowed.example/c", "snippet": "ok"},
+                    {"title": "Bad scheme", "url": "javascript:alert(1)", "snippet": "x"},
+                    {"title": "Duplicate", "url": "https://allowed.example/a", "snippet": "dup"},
+                    *[
+                        {
+                            "title": f"Extra {i}",
+                            "url": f"https://allowed.example/{i}",
+                            "snippet": "x",
+                        }
+                        for i in range(12)
+                    ],
+                ]
+            }
+        )
+
+    class StubStore:
+        def __init__(self, cfg):
+            self.cfg = cfg
+
+        def get_settings(self):
+            return {"websearch": self.cfg}
+
+    async def run_all() -> None:
+        app = web.Application()
+        app.router.add_get("/{kind}", handler)
+        http_runner = web.AppRunner(app)
+        await http_runner.setup()
+        site = web.TCPSite(http_runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        base = f"http://127.0.0.1:{port}"
+
+        async def case(cfg, args, approve=True):
+            approvals = []
+            runner = None
+
+            async def emit(event):
+                if event.get("type") == "approval":
+                    approvals.append(event)
+                    future = runner.pending.get(event["id"])
+                    if future is not None and not future.done():
+                        future.set_result(approve)
+
+            runner = ai.ChatRunner(None, StubStore(cfg), emit, {})
+            ok, out = await runner._run_tool("websearch", args)
+            return ok, out, approvals
+
+        def reset():
+            hits["count"] = 0
+            hits["queries"].clear()
+
+        try:
+            reset()
+            ok, out, approvals = await case({}, {"query": "hexhub"})
+            check(
+                "ai: websearch disabled by default",
+                ok is False
+                and (out.get("error") or {}).get("code") == "websearch_disabled"
+                and (out.get("error") or {}).get("status") == 501
+                and approvals == []
+                and hits["count"] == 0,
+                str(out)[:300],
+            )
+
+            reset()
+            ok, out, approvals = await case({"enabled": True, "endpoint": ""}, {"query": "hexhub"})
+            check(
+                "ai: websearch unconfigured makes no request",
+                ok is False
+                and (out.get("error") or {}).get("code") == "websearch_not_configured"
+                and (out.get("error") or {}).get("status") == 501
+                and approvals == []
+                and hits["count"] == 0,
+                str(out)[:300],
+            )
+
+            reset()
+            ok, out, approvals = await case(
+                {"enabled": True, "endpoint": "ftp://example.com/search"}, {"query": "hexhub"}
+            )
+            check(
+                "ai: websearch rejects non-http endpoint",
+                ok is False
+                and (out.get("error") or {}).get("code") == "websearch_endpoint_invalid"
+                and approvals == []
+                and hits["count"] == 0,
+                str(out)[:300],
+            )
+
+            reset()
+            ok, out, approvals = await case(
+                {"enabled": True, "endpoint": base + "/ok"}, {"query": "   "}
+            )
+            check(
+                "ai: websearch validates query before approval",
+                ok is False
+                and (out.get("error") or {}).get("code") == "invalid_query"
+                and approvals == []
+                and hits["count"] == 0,
+                str(out)[:300],
+            )
+
+            reset()
+            ok, out, approvals = await case(
+                {"enabled": True, "endpoint": base + "/ok"}, {"query": "a\nb"}
+            )
+            check(
+                "ai: websearch rejects control characters",
+                ok is False and (out.get("error") or {}).get("code") == "invalid_query",
+                str(out)[:300],
+            )
+
+            reset()
+            ok, out, approvals = await case(
+                {"enabled": True, "endpoint": base + "/ok"},
+                {"query": "hexhub", "allowed_domains": "allowed.example"},
+            )
+            check(
+                "ai: websearch validates domain lists",
+                ok is False
+                and (out.get("error") or {}).get("code") == "invalid_domains"
+                and approvals == [],
+                str(out)[:300],
+            )
+
+            reset()
+            ok, out, approvals = await case(
+                {"enabled": True, "endpoint": base + "/ok"}, {"query": "hexhub"}, approve=False
+            )
+            check(
+                "ai: websearch rejection skips network",
+                ok is False and "拒绝" in str(out) and len(approvals) == 1 and hits["count"] == 0,
+                str(out)[:300],
+            )
+
+            reset()
+            ok, out, approvals = await case(
+                {"enabled": True, "endpoint": base + "/ok", "maxResults": 8},
+                {
+                    "query": "h1k hub",
+                    "max_results": 2,
+                    "allowed_domains": ["allowed.example"],
+                    "blocked_domains": ["blocked.example"],
+                },
+            )
+            results = (out or {}).get("results") or []
+            snippet = results[0]["snippet"] if results else ""
+            check(
+                "ai: websearch approved parses and filters results",
+                ok is True
+                and out.get("count") == 2
+                and out.get("engine") == "127.0.0.1"
+                and out.get("truncated") is True
+                and all("allowed.example" in item["url"] for item in results)
+                and not any("blocked.example" in item["url"] for item in results)
+                and len(approvals) == 1
+                and approvals[0].get("kind") == "websearch"
+                and (approvals[0].get("detail") or {}).get("endpoint") == "127.0.0.1"
+                and hits["count"] == 1
+                and hits["queries"] == ["h1k hub"],
+                str(out)[:400],
+            )
+            check(
+                "ai: websearch truncates long snippet",
+                "truncated" in snippet and len(snippet) < 1200,
+                f"len={len(snippet)}",
+            )
+
+            reset()
+            ok, out, _ = await case(
+                {"enabled": True, "endpoint": base + "/ok"}, {"query": "x", "max_results": 99}
+            )
+            check(
+                "ai: websearch clamps max_results to 10",
+                ok is True and out.get("count") == 10,
+                str(out)[:300],
+            )
+
+            reset()
+            ok, out, _ = await case(
+                {"enabled": True, "endpoint": base + "/ok?q={query}&format=json"}, {"query": "a b"}
+            )
+            check(
+                "ai: websearch expands {query} template",
+                ok is True and hits["queries"] == ["a b"],
+                str(hits["queries"])[:200],
+            )
+
+            reset()
+            ok, out, _ = await case(
+                {"enabled": True, "endpoint": base + "/bad"}, {"query": "hexhub"}
+            )
+            check(
+                "ai: websearch rejects non-JSON response",
+                ok is False and (out.get("error") or {}).get("code") == "websearch_bad_response",
+                str(out)[:300],
+            )
+
+            reset()
+            ok, out, _ = await case(
+                {"enabled": True, "endpoint": base + "/error"}, {"query": "hexhub"}
+            )
+            check(
+                "ai: websearch surfaces HTTP errors",
+                ok is False
+                and (out.get("error") or {}).get("code") == "websearch_http_error"
+                and (out.get("error") or {}).get("status") == 502,
+                str(out)[:300],
+            )
+
+            reset()
+            ok, out, _ = await case(
+                {"enabled": True, "endpoint": base + "/slow", "timeoutSeconds": 1},
+                {"query": "hexhub"},
+            )
+            check(
+                "ai: websearch times out",
+                ok is False and (out.get("error") or {}).get("code") == "websearch_timeout",
+                str(out)[:300],
+            )
+        finally:
+            await http_runner.cleanup()
+
+    asyncio.run(run_all())
+
+
+def start_search_stub():
+    """Start a loopback JSON search endpoint for the mock-LLM E2E cases."""
+    hits = {"count": 0, "queries": []}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 - stdlib handler API
+            parsed = urllib.parse.urlsplit(self.path)
+            hits["count"] += 1
+            hits["queries"].append((urllib.parse.parse_qs(parsed.query).get("q") or [""])[0])
+            payload = {
+                "results": [
+                    {
+                        "title": f"H1KHub 搜索结果 {i}",
+                        "url": f"https://search.example/{i}",
+                        "snippet": f"本地桩摘要 {i}",
+                    }
+                    for i in range(1, 6)
+                ]
+            }
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):  # silence the per-request stderr line
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread, hits
+
+
 def main() -> int:
     global BASE, TOKEN, ORIGINAL_AI
     parser = argparse.ArgumentParser()
@@ -322,6 +618,7 @@ def main() -> int:
 
     settings = data_of(req("/api/settings", method="GET"))
     ORIGINAL_AI = json.loads(json.dumps(settings.get("ai") or {}))
+    ORIGINAL_WEBSEARCH = json.loads(json.dumps(settings.get("websearch") or {}))
     mock_provider = {
         "id": "mock",
         "name": "Mock LLM",
@@ -506,6 +803,100 @@ def main() -> int:
             and "invalid_action" in (bad_docker_result.get("output") or ""),
             str(bad_docker_result)[:300],
         )
+
+        print("\n[tool: websearch]")
+        websearch_stub_tests()
+        search_server, search_thread, search_hits = start_search_stub()
+        search_url = f"http://127.0.0.1:{search_server.server_address[1]}/search"
+        try:
+            disabled = asyncio.run(run_chat('@tool websearch {"query":"h1khub off"}'))
+            disabled_result = (disabled["toolResults"] or [{}])[0]
+            check(
+                "ai: websearch disabled makes no request",
+                disabled_result.get("ok") is False
+                and "websearch_disabled" in (disabled_result.get("output") or "")
+                and disabled["approvals"] == 0
+                and search_hits["count"] == 0,
+                str(disabled_result)[:300],
+            )
+
+            req(
+                "/api/settings",
+                {"websearch": {"enabled": True, "endpoint": "", "timeoutSeconds": 5, "maxResults": 3}},
+                method="PUT",
+            )
+            unconfigured = asyncio.run(run_chat('@tool websearch {"query":"h1khub unconfigured"}'))
+            unconfigured_result = (unconfigured["toolResults"] or [{}])[0]
+            check(
+                "ai: websearch unconfigured makes no request",
+                unconfigured_result.get("ok") is False
+                and "websearch_not_configured" in (unconfigured_result.get("output") or "")
+                and unconfigured["approvals"] == 0
+                and search_hits["count"] == 0,
+                str(unconfigured_result)[:300],
+            )
+
+            req(
+                "/api/settings",
+                {
+                    "websearch": {
+                        "enabled": True,
+                        "endpoint": search_url + "?q={query}&format=json",
+                        "timeoutSeconds": 5,
+                        "maxResults": 3,
+                    }
+                },
+                method="PUT",
+            )
+            approved = asyncio.run(run_chat('@tool websearch {"query":"h1khub e2e","max_results":3}'))
+            approved_result = (approved["toolResults"] or [{}])[0]
+            try:
+                approved_data = json.loads(approved_result.get("output") or "{}")
+            except json.JSONDecodeError:
+                approved_data = {}
+            check(
+                "ai: websearch approved returns local stub results",
+                approved_result.get("ok") is True
+                and approved["approvals"] == 1
+                and approved_data.get("count") == 3
+                and "H1KHub 搜索结果 1" in (approved_result.get("output") or ""),
+                str(approved_result)[:400],
+            )
+            check(
+                "ai: websearch sends query to configured endpoint",
+                search_hits["queries"] == ["h1khub e2e"],
+                str(search_hits)[:300],
+            )
+
+            before_reject = search_hits["count"]
+            rejected = asyncio.run(
+                run_chat('@tool websearch {"query":"h1khub reject"}', approve=False)
+            )
+            rejected_result = (rejected["toolResults"] or [{}])[0]
+            check(
+                "ai: websearch rejected",
+                rejected_result.get("ok") is False
+                and "拒绝" in (rejected_result.get("output") or "")
+                and rejected["approvals"] == 1
+                and search_hits["count"] == before_reject,
+                str(rejected_result)[:300],
+            )
+
+            before_bad = search_hits["count"]
+            invalid = asyncio.run(run_chat('@tool websearch {"query":""}'))
+            invalid_result = (invalid["toolResults"] or [{}])[0]
+            check(
+                "ai: websearch validates before approval",
+                invalid_result.get("ok") is False
+                and "invalid_query" in (invalid_result.get("output") or "")
+                and invalid["approvals"] == 0
+                and search_hits["count"] == before_bad,
+                str(invalid_result)[:300],
+            )
+        finally:
+            req("/api/settings", {"websearch": ORIGINAL_WEBSEARCH}, method="PUT")
+            search_server.shutdown()
+            search_server.server_close()
 
         print("\n[tool: scp upload/download]")
         up = asyncio.run(run_chat(f'@tool scp_upload {{"asset_id":"{ssh_id}","local_path":"{local_up}","remote_path":"{remote}"}}'))

@@ -95,6 +95,15 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "blockUnreferencedAssetExecution": False,
         "maxToolRounds": 12,
     },
+    # 联网搜索（websearch）是显式选择加入的能力：默认关闭且没有默认端点。
+    # 未配置时 websearch 工具只返回结构化错误，不发起任何网络请求；原版
+    # HexHub 的默认云地址（api.hexhub.cn）只作为逆向资料记录，绝不作为回退。
+    "websearch": {
+        "enabled": False,
+        "endpoint": "",
+        "timeoutSeconds": 15,
+        "maxResults": 8,
+    },
     "ai": {
         "providers": [],
         "activeProviderId": "",

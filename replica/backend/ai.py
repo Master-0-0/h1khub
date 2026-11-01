@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 from typing import Any
+from urllib.parse import quote, urlsplit
 
 import aiohttp
 
@@ -29,6 +30,7 @@ SYSTEM_PROMPT = """你是 H1KHub（数据库 / SSH / SFTP / Docker 一体化桌�
 - 执行 Redis 命令、查看 Docker 容器与日志、启动/停止/重启 Docker 容器
 - 浏览 FTP 目录，上传/下载/删除/重命名 FTP 文件
 - 读取当前打开终端的内容
+- 联网搜索网页（websearch；必须由用户显式配置端点，默认关闭，每次调用都需要审批）
 
 行为准则：
 1. 先用工具确认事实，再下结论；不要编造文件内容、命令输出或查询结果。
@@ -37,6 +39,7 @@ SYSTEM_PROMPT = """你是 H1KHub（数据库 / SSH / SFTP / Docker 一体化桌�
 4. 对本地系统与远程服务器保持最小改动原则；删除/覆盖前先确认。
 5. 使用用户当前的语言回答，回答简洁、可执行，必要时给出命令与回滚方式。
 6. 数据库标识符遵循目标方言的引号规则；大结果集先分页或加 LIMIT。
+7. 联网搜索只能使用 websearch 工具并等待审批；未配置时不要用 shell + curl/wget 或其他方式绕过。
 """
 
 
@@ -255,6 +258,26 @@ TOOLS: list[dict] = [
         {"url": {"type": "string"}},
         ["url"],
     ),
+    _tool(
+        "websearch",
+        "联网搜索网页，返回结果标题、链接与摘要（需要用户审批）。默认关闭且没有默认端点；"
+        "未配置时返回 websearch_not_configured，不会发起任何网络请求。",
+        {
+            "query": {"type": "string", "description": "搜索关键词"},
+            "max_results": {"type": "integer", "description": "最多返回条数（1-10），默认取设置值"},
+            "allowed_domains": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "可选：仅保留这些域名（含子域）",
+            },
+            "blocked_domains": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "可选：排除这些域名（含子域）",
+            },
+        },
+        ["query"],
+    ),
 ]
 
 TERMINAL_TOOL_NAMES = {
@@ -300,6 +323,29 @@ WRAPPER_TOKENS = re.compile(r"(^|[\s;&|()])(sudo|doas|exec|nohup|setsid|env)(\s|
 
 SQL_READ = re.compile(r"^\s*(select|show|describe|desc|explain|with|pragma|values)\b", re.I)
 DOCKER_ACTIONS = ("start", "stop", "restart")
+
+# ------------------------------------------------------------------ websearch
+# 降级策略（与原版 NewWebSearchTool 的差异，务必保持）：
+# - 原版由 Go 后端直接抓 DuckDuckGo HTML（searchDuckDuckGo + filterByDomain），
+#   默认云地址是 https://api.hexhub.cn；复刻版不内置任何搜索后端，也不把
+#   api.hexhub.cn 或 DuckDuckGo 作为回退。
+# - 端点只能由用户在 settings.websearch 中显式配置；enabled=False 或 endpoint
+#   为空时 tool_websearch 直接返回结构化错误，绝不创建 aiohttp 会话、绝不发起
+#   DNS/HTTP 请求（测试用本地桩断言命中数为 0）。
+# - 端点响应约定为 JSON：{"results": [{"title", "url", "snippet"}]}，也接受裸数组
+#   以及 items / data 字段；单次响应最多读取 1 MB，默认 15 s 超时。
+WEBSEARCH_MAX_RESULTS = 10
+WEBSEARCH_MAX_QUERY_CHARS = 500
+WEBSEARCH_MAX_RESPONSE_BYTES = 1_000_000
+WEBSEARCH_DEFAULT_TIMEOUT = 15
+WEBSEARCH_MAX_TIMEOUT = 30
+WEBSEARCH_TITLE_LIMIT = 300
+WEBSEARCH_SNIPPET_LIMIT = 1000
+WEBSEARCH_CONFIG_HINT = (
+    'PUT /api/settings {"websearch":{"enabled":true,'
+    '"endpoint":"https://<searxng-host>/search?q={query}&format=json"}}'
+)
+
 REDIS_READ_COMMANDS = {
     "get", "mget", "strlen", "ttl", "pttl", "type", "exists", "keys", "scan", "dbsize",
     "hget", "hgetall", "hkeys", "hvals", "hlen", "hexists", "hmget",
@@ -754,6 +800,10 @@ class ChatRunner:
         if kind == "docker_action":
             return False
         if kind == "ftp_write":
+            return False
+        if kind == "websearch":
+            # 联网搜索始终需要审批：即使开启了“静默命令”，也不能让模型在
+            # 未经确认的情况下把关键字发给外部端点。
             return False
         return False
 
@@ -1274,3 +1324,256 @@ class ChatRunner:
                     "contentType": content_type,
                     "text": clamp_text(text, 200_000),
                 }
+
+    # ------------------------------------------------------------- websearch
+    def _websearch_config(self) -> dict:
+        if self.store is None:
+            return {}
+        try:
+            settings = self.store.get_settings() or {}
+        except Exception:
+            return {}
+        cfg = settings.get("websearch") if isinstance(settings, dict) else None
+        return cfg if isinstance(cfg, dict) else {}
+
+    @staticmethod
+    def _websearch_error(
+        code: str, message: str, *, status: int = 400, configure: str | None = None
+    ) -> dict:
+        error: dict[str, Any] = {"code": code, "status": status, "message": message}
+        if configure:
+            error["configure"] = configure
+        return {"error": error}
+
+    @staticmethod
+    def _websearch_domains(value: Any, field: str) -> list[str]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise ValueError(f"{field} 必须是字符串数组")
+        out: list[str] = []
+        for raw in value:
+            if not isinstance(raw, str):
+                raise ValueError(f"{field} 必须是字符串数组")
+            item = raw.strip().lower().rstrip(".")
+            if not item:
+                continue
+            if item.startswith("*."):
+                item = item[2:]
+            item = item.lstrip(".")
+            if (
+                not item
+                or len(item) > 253
+                or any(ch in item for ch in "/\\:@?#")
+                or any(ch.isspace() for ch in item)
+                or "\x00" in item
+            ):
+                raise ValueError(f"{field} 含非法域名：{raw[:80]}")
+            if item not in out:
+                out.append(item)
+        if len(out) > 20:
+            raise ValueError(f"{field} 最多 20 个域名")
+        return out
+
+    @staticmethod
+    def _websearch_match(host: str, domains: list[str]) -> bool:
+        host = host.lower().rstrip(".")
+        return any(host == item or host.endswith("." + item) for item in domains)
+
+    @staticmethod
+    def _websearch_url(endpoint: str, query: str) -> tuple[str | None, str | None]:
+        raw = endpoint.strip()
+        if not raw:
+            return None, None
+        if "{query}" in raw:
+            url = raw.replace("{query}", quote(query, safe=""))
+        else:
+            url = raw + ("&" if "?" in raw else "?") + "q=" + quote(query, safe="")
+        try:
+            parts = urlsplit(url)
+            host = parts.hostname
+        except ValueError:
+            return None, None
+        if parts.scheme.lower() not in ("http", "https") or not host:
+            return None, None
+        return url, host
+
+    async def tool_websearch(self, args: dict):
+        query = str(args.get("query") or "").strip()
+        if not query:
+            return False, self._websearch_error("invalid_query", "query 不能为空")
+        if any(ord(ch) < 32 for ch in query):
+            return False, self._websearch_error("invalid_query", "query 不能包含控制字符")
+        query = re.sub(r"\s+", " ", query)
+        if len(query) > WEBSEARCH_MAX_QUERY_CHARS:
+            return False, self._websearch_error(
+                "invalid_query", f"query 不能超过 {WEBSEARCH_MAX_QUERY_CHARS} 个字符"
+            )
+
+        try:
+            allowed = self._websearch_domains(args.get("allowed_domains"), "allowed_domains")
+            blocked = self._websearch_domains(args.get("blocked_domains"), "blocked_domains")
+        except ValueError as exc:
+            return False, self._websearch_error("invalid_domains", str(exc))
+
+        cfg = self._websearch_config()
+        raw_max = args.get("max_results")
+        if raw_max is None:
+            raw_max = cfg.get("maxResults", 8)
+        try:
+            if isinstance(raw_max, bool):
+                raise ValueError
+            max_results = int(raw_max)
+        except (TypeError, ValueError):
+            return False, self._websearch_error("invalid_max_results", "max_results 必须是整数")
+        max_results = max(1, min(WEBSEARCH_MAX_RESULTS, max_results))
+
+        if not bool(cfg.get("enabled")):
+            return False, self._websearch_error(
+                "websearch_disabled",
+                "联网搜索已关闭（settings.websearch.enabled=false），未发起任何网络请求。",
+                status=501,
+                configure=WEBSEARCH_CONFIG_HINT,
+            )
+        endpoint = str(cfg.get("endpoint") or "").strip()
+        if not endpoint:
+            return False, self._websearch_error(
+                "websearch_not_configured",
+                "联网搜索端点未配置（settings.websearch.endpoint 为空），未发起任何网络请求。",
+                status=501,
+                configure=WEBSEARCH_CONFIG_HINT,
+            )
+        url, host = self._websearch_url(endpoint, query)
+        if not url or not host:
+            return False, self._websearch_error(
+                "websearch_endpoint_invalid",
+                "联网搜索端点必须是带主机名的 http(s) URL。",
+                status=400,
+                configure=WEBSEARCH_CONFIG_HINT,
+            )
+
+        try:
+            timeout_seconds = int(cfg.get("timeoutSeconds") or WEBSEARCH_DEFAULT_TIMEOUT)
+        except (TypeError, ValueError):
+            timeout_seconds = WEBSEARCH_DEFAULT_TIMEOUT
+        timeout_seconds = max(1, min(WEBSEARCH_MAX_TIMEOUT, timeout_seconds))
+
+        if not await self._require(
+            "websearch",
+            f"联网搜索「{clamp_text(query, 80)}」",
+            {
+                "query": clamp_text(query, 200),
+                "endpoint": host,
+                "maxResults": max_results,
+                "allowedDomains": allowed,
+                "blockedDomains": blocked,
+            },
+        ):
+            return False, "用户拒绝联网搜索"
+
+        timeout = aiohttp.ClientTimeout(total=timeout_seconds, connect=min(5, timeout_seconds))
+        headers = {"Accept": "application/json", "User-Agent": "H1KHub/5.1.9 websearch"}
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url, headers=headers, allow_redirects=True) as resp:
+                    if not 200 <= resp.status < 300:
+                        return False, self._websearch_error(
+                            "websearch_http_error",
+                            f"搜索端点返回 HTTP {resp.status}",
+                            status=502,
+                        )
+                    raw = await resp.content.read(WEBSEARCH_MAX_RESPONSE_BYTES + 1)
+        except asyncio.TimeoutError:
+            return False, self._websearch_error(
+                "websearch_timeout", f"搜索超时（>{timeout_seconds}s）", status=504
+            )
+        except aiohttp.ClientError as exc:
+            return False, self._websearch_error(
+                "websearch_failed", f"{type(exc).__name__}: {exc}", status=502
+            )
+
+        if len(raw) > WEBSEARCH_MAX_RESPONSE_BYTES:
+            return False, self._websearch_error(
+                "websearch_response_too_large",
+                f"搜索端点响应超过 {WEBSEARCH_MAX_RESPONSE_BYTES} 字节",
+                status=502,
+            )
+        try:
+            payload = json.loads(raw.decode("utf-8", "replace"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return False, self._websearch_error(
+                "websearch_bad_response", "搜索端点返回的不是合法 JSON", status=502
+            )
+
+        if isinstance(payload, list):
+            items = payload
+        elif isinstance(payload, dict):
+            items = payload.get("results")
+            if items is None:
+                items = payload.get("items")
+            if items is None:
+                items = payload.get("data")
+        else:
+            items = None
+        if not isinstance(items, list):
+            return False, self._websearch_error(
+                "websearch_bad_response", "搜索端点 JSON 缺少 results 数组", status=502
+            )
+
+        results: list[dict] = []
+        seen: set[str] = set()
+        clipped = False
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            title = next(
+                (item[k] for k in ("title", "name") if isinstance(item.get(k), str)), ""
+            )
+            link = next(
+                (item[k] for k in ("url", "link", "href") if isinstance(item.get(k), str)), ""
+            )
+            snippet = next(
+                (
+                    item[k]
+                    for k in ("snippet", "description", "content", "summary")
+                    if isinstance(item.get(k), str)
+                ),
+                "",
+            )
+            link = link.strip()
+            parts = None
+            try:
+                parts = urlsplit(link)
+                link_host = parts.hostname
+            except ValueError:
+                link_host = None
+            if parts is None or parts.scheme.lower() not in ("http", "https") or not link_host:
+                continue
+            if allowed and not self._websearch_match(link_host, allowed):
+                continue
+            if blocked and self._websearch_match(link_host, blocked):
+                continue
+            if link in seen:
+                continue
+            seen.add(link)
+            title_text = " ".join(title.split())
+            snippet_text = " ".join(snippet.split())
+            if len(title_text) > WEBSEARCH_TITLE_LIMIT or len(snippet_text) > WEBSEARCH_SNIPPET_LIMIT:
+                clipped = True
+            results.append(
+                {
+                    "title": clamp_text(title_text, WEBSEARCH_TITLE_LIMIT) or link_host,
+                    "url": clamp_text(link, 2048),
+                    "snippet": clamp_text(snippet_text, WEBSEARCH_SNIPPET_LIMIT),
+                }
+            )
+            if len(results) >= max_results:
+                break
+
+        return True, {
+            "query": query,
+            "engine": host,
+            "count": len(results),
+            "truncated": clipped,
+            "results": results,
+        }

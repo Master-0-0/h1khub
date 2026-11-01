@@ -2324,6 +2324,125 @@ grep -c "async def tool_" backend/ai.py                                         
 
 ### 35.6 边界与未做
 
-- 未实现资产 CRUD（方向 D）、`websearch`（方向 B）、VNC/RDP 后端、会话/PTY 新建；这些仍在待办池。
+- 未实现资产 CRUD（方向 D）、VNC/RDP 后端、会话/PTY 新建；这些仍在待办池（`websearch` 已在 §36 实现）。
 - `docker_container_action` 仅开放 start/stop/restart，不开放 `kill` / `pause` / `remove`，避免误删。
 - FTP 写工具复用现有 FTP 资产配置；SFTP 资产仍走 `scp_*` / 文件面板。
+
+---
+
+## 36. AI 工具面扩展：联网搜索 `websearch`（方向 B，2026-11-01）
+
+本轮按方向 B 增加第 26 个工具 `websearch`，不改动流式解析（OpenAI / Anthropic）
+与审批框架，只做增量。
+
+原版参考（只读逆向证据）：
+
+- Go 符号 `hexhub-agent/core/plugins/hexhub-plugin-repository/core/llm/tools.NewWebSearchTool`
+  及其 `func1` / `func1.1`、`recoverWebSearchErrorResult`、`WebSearchHit`；
+- 反汇编可见 `searchDuckDuckGo` + `filterByDomain`，参数为 `query` /
+  `allowed_domains` / `blocked_domains`，结果上限 10，描述为
+  “Search the web and return result links with title and snippet.”；
+- 前端 bundle 中的默认云地址 `https://api.hexhub.cn` 只作为**历史事实**记录，
+  复刻版不把它（也不把 DuckDuckGo HTML）作为默认端点或回退。
+
+### 36.1 代码变更
+
+| 文件 | 变更 |
+|---|---|
+| `backend/ai.py` | `TOOLS` 新增 `websearch`；新增 `tool_websearch` 及配置读取/域名过滤/URL 模板/结构化错误辅助方法；`_silent` 声明 `websearch` 恒需审批；系统提示词补充联网搜索边界与“禁止用 shell 绕过” |
+| `backend/store.py` | `DEFAULT_SETTINGS` 新增 `websearch`：`enabled=False`、`endpoint=""`、`timeoutSeconds=15`、`maxResults=8` |
+| `frontend/src/components/SettingsDialog.vue` + `frontend/dist/*` | 设置 → Agent 增加“联网搜索”配置（启用、端点、超时、最多结果），保存走既有 `PUT /api/settings` |
+| `scripts/test_ai.py` | `TOOLS=26 & handlers` 断言；14 条进程内桩用例 + 6 条 mock LLM 端到端用例；本地搜索桩命中计数用于证明“未配置零请求” |
+| `README.md` / `docs/feature-matrix.csv` / `docs/completion-audit.csv` | 计数 25 → 26、工具枚举、审批说明、降级策略 |
+
+工具总数 **25 → 26**（`len(TOOLS)` 为唯一依据）。
+
+### 36.2 降级策略（明确且可测试）
+
+1. **配置来源**：新增 `settings.websearch`，不使用环境变量。理由：设置可热更新并持久化，
+   测试可通过 `PUT /api/settings` 切换，且与现有 `agent`/`ai` 设置的生命周期一致；
+   环境变量需要重启服务，无法在运行期关闭，也无法被端到端测试覆盖。
+2. **默认关闭 + 无默认端点**：`enabled=False` 或 `endpoint` 为空时，`tool_websearch`
+   在**审批之前**返回结构化错误 `websearch_disabled` / `websearch_not_configured`
+   （`status: 501`），不创建 `aiohttp.ClientSession`、不解析 DNS、不发送 HTTP；
+   错误体附带 `configure` 提示（`PUT /api/settings ...`）。测试用本地桩的命中计数断言为 0。
+3. **禁止默认云地址**：没有任何回退端点；`api.hexhub.cn` 与 DuckDuckGo 只出现在本文档的
+   历史说明中。端点必须由用户显式配置为 `http(s)` URL。
+4. **总开关**：`enabled` 即总开关；关闭后同样零请求。
+5. **独立审批**：审批 kind 为 `websearch`，`_silent` 恒返回 `False`，不复用 `shell` /
+   `write_file`；审批卡片只展示查询词、端点主机名、结果条数与域名过滤，不展示完整
+   endpoint 路径（避免把 URL 中的参数带回模型）。批准后仍受“本会话记住”框架约束。
+6. **网络边界**：默认 15 s 总超时（设置范围 1–30 s），响应最多读取 1 MB，超过返回
+   `websearch_response_too_large`；标题/摘要用 `clamp_text` 截断到 300/1000 字符；
+   最多返回 10 条；`allowed_domains` / `blocked_domains` 在解析后按主机名后缀过滤。
+7. **端点响应契约**：`GET`，JSON `{"results":[{"title","url","snippet"}]}`，兼容裸数组、
+   `items`、`data` 与 `name`/`link`/`href`、`description`/`content`/`summary` 别名；
+   `{query}` 占位符做 URL 编码替换，无占位符时自动追加 `q=`。只支持 JSON，不抓 HTML
+   （原版 DuckDuckGo HTML 抓取不复刻）。
+8. **子集决策**：**不纳入** `TERMINAL_TOOL_NAMES`（13 个）与 `SQL_TOOL_NAMES`（5 个）。
+   理由：这两个助手是终端/SQL 场景的受限工具面，联网搜索会把任意外部文本带回上下文，
+   与“终端上下文/SQL 草稿”边界无关；保持既有子集可避免扩大两个专用助手的外发面，
+   既有 mode 限制测试无需改动。
+
+### 36.3 审批与错误码
+
+| 场景 | 审批 | 结果 |
+|---|---|---|
+| 未启用 | 不弹审批 | `websearch_disabled`（501），零请求 |
+| 已启用但端点为空 | 不弹审批 | `websearch_not_configured`（501），零请求 |
+| 端点非 http(s) | 不弹审批 | `websearch_endpoint_invalid`（400），零请求 |
+| 查询为空/含控制字符/超长 | 不弹审批 | `invalid_query`（400） |
+| 域名列表非法 | 不弹审批 | `invalid_domains`（400） |
+| 用户拒绝 | `websearch` 审批一次 | “用户拒绝联网搜索”，零请求 |
+| 批准 | `websearch` 审批一次 | 请求端点；超时/HTTP/坏 JSON 分别为 `websearch_timeout`（504）/`websearch_http_error`（502）/`websearch_bad_response`（502） |
+
+### 36.4 测试与证据
+
+命令与日志：
+
+```
+cd replica
+python3 scripts/test_ai.py --base http://127.0.0.1:38110 2>&1 | tee /tmp/h1khub-test_ai.log
+# PASS=68 FAIL=0（基线 48 + 本轮 20）
+```
+
+覆盖（全部本地，无外部模型/网络）：
+
+- 进程内（14 条）：默认关闭、未配置、非 http 端点、空查询、控制字符、非法域名列表、
+  拒绝路径零请求、批准后解析/域名过滤/去重、长摘要截断、`max_results` 截到 10、
+  `{query}` 模板、坏 JSON、HTTP 500、1 s 超时。
+- mock LLM 端到端（6 条）：关闭零请求、未配置零请求、批准后返回本地桩结果、
+  查询确实发送到配置端点、拒绝路径零请求、空查询在审批前失败。
+- 设置 UI（headless Chromium/CDP，一次性往返检查，未纳入 `test_ai.py`）：
+  「设置 → Agent → 联网搜索」的启用开关、端点、超时、最多结果 4 个控件存在；
+  修改后保存，`GET /api/settings` 回读为 `enabled=true / endpoint=… / timeoutSeconds=7 / maxResults=4`，
+  随后经 API 还原默认值。
+- 回归：既有流式对话、shell 审批/拒绝、FTP 全写操作、Docker 动作、SCP、隧道、
+  SQL/Terminal 模式保持 PASS。
+
+### 36.5 文档计数同步（25 → 26）
+
+| 位置 | 现值 |
+|---|---|
+| `README.md:187`（目录树） | 26 个工具 |
+| `README.md:317`（AI Agent 能力表） | 26 个（补 websearch） |
+| `README.md:397`（审批说明） | 补联网搜索独立审批、默认关闭、无默认端点与端点契约 |
+| `docs/feature-matrix.csv:72` | 26 个工具；新增“工具-联网搜索”行 |
+| `docs/completion-audit.csv:77` | AI 工具 26 个 |
+| `docs/verification.md` | 本节（§36） |
+
+核对命令：
+
+```
+python3 -c "import sys;sys.path.insert(0,'backend');import ai;print(len(ai.TOOLS))"   # → 26
+grep -c "async def tool_" backend/ai.py                                              # → 26
+```
+
+### 36.6 边界与未做
+
+- 不内置任何搜索后端；用户需自备 JSON 搜索端点（例如开启 JSON 输出的 SearXNG）。
+  这是有意的降级：原版直接抓 DuckDuckGo HTML，复刻版不把第三方抓取作为默认行为。
+- 不保存单独的搜索 API Key；`endpoint` 会原样保存在本机设置中，不应把长期密钥放进 URL。
+- 不抓取 HTML 搜索结果、不做结果缓存、不做跨轮次去重；结果只按本次调用返回。
+- 端点由用户配置，模型只能控制查询词与域名过滤，不能改变目标主机；因此审批卡片
+  展示的是端点主机名而非完整 URL。
