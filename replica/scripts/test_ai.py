@@ -14,6 +14,7 @@ import base64
 import json
 import os
 import random
+import shutil
 import socket
 import subprocess
 import sys
@@ -172,6 +173,136 @@ def batch_exec(asset_id: str, command: str) -> str:
     return results[0].get("stdout") or ""
 
 
+def ftp_names(asset_id: str, path: str = "/") -> list[str]:
+    """List an FTP directory through the agent so the check stays server-agnostic."""
+    chat = asyncio.run(run_chat(f'@tool ftp_list {{"asset_id":"{asset_id}","path":"{path}"}}'))
+    result = (chat["toolResults"] or [{}])[0]
+    try:
+        data = json.loads(result.get("output") or "{}")
+    except json.JSONDecodeError:
+        return []
+    return [str(entry.get("name")) for entry in data.get("entries") or []]
+
+
+DOCKER_STUB = """#!/bin/sh
+if [ "$1" = "ps" ]; then
+  printf '%s\\n' '{"ID":"stub0001","Names":"stub-container","Image":"busybox","State":"running"}'
+  printf '%s\\n' '{"ID":"boom0001","Names":"boom-container","Image":"busybox","State":"running"}'
+  exit 0
+fi
+case "$1" in
+  start|stop|restart)
+    if [ "$2" = "boom-container" ]; then
+      echo "Error response from daemon: cannot $1 container" >&2
+      exit 1
+    fi
+    echo "$2"
+    exit 0
+    ;;
+esac
+echo "stub docker: unsupported $*" >&2
+exit 1
+"""
+
+
+def docker_action_stub_tests() -> None:
+    """Hermetic docker_container_action coverage with a stub `docker` CLI.
+
+    The agent's tool layer (approval -> existence check -> CLI action -> error
+    shaping) is exercised in-process; no Docker daemon or real container is
+    touched. Path-confinement for FTP is checked with a synthetic home directory.
+    """
+    backend = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "backend")
+    if backend not in sys.path:
+        sys.path.insert(0, backend)
+    import ai
+    from docker_svc import DockerService
+    from ftp_svc import FTPClient, FTPError
+
+    stub_dir = tempfile.mkdtemp(prefix="h1khub-docker-stub-")
+    stub_path = os.path.join(stub_dir, "docker")
+    with open(stub_path, "w", encoding="utf-8") as fh:
+        fh.write(DOCKER_STUB)
+    os.chmod(stub_path, 0o755)
+    old_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = stub_dir + os.pathsep + old_path
+
+    async def emit(event):
+        if event.get("type") == "approval":
+            future = runner.pending.get(event["id"])
+            if future is not None and not future.done():
+                future.set_result(True)
+
+    async def call(args):
+        return await runner._run_tool("docker_container_action", args)
+
+    names = [tool["name"] for tool in ai.TOOLS]
+    handlers = {name[5:] for name in dir(ai.ChatRunner) if name.startswith("tool_")}
+    check(
+        "ai: TOOLS = 25 and handlers match",
+        len(names) == 25 and set(names) == handlers,
+        f"count={len(names)} orphan={sorted(set(names) ^ handlers)}",
+    )
+
+    try:
+        class StubHub:
+            async def docker(self, asset_id):
+                return DockerService({"mode": "local"}), None
+
+        runner = ai.ChatRunner(StubHub(), None, emit, {})
+        for action in ("start", "stop", "restart"):
+            ok, out = asyncio.run(call({"container": "stub-container", "action": action}))
+            check(
+                f"ai: docker_container_action approved {action}",
+                ok is True and out.get("action") == action and out.get("container") == "stub-container",
+                str(out)[:300],
+            )
+        ok, out = asyncio.run(call({"container": "missing-container", "action": "start"}))
+        check(
+            "ai: docker_container_action rejects unknown container",
+            ok is False and (out.get("error") or {}).get("code") == "container_not_found",
+            str(out)[:300],
+        )
+        ok, out = asyncio.run(call({"container": "boom-container", "action": "stop"}))
+        check(
+            "ai: docker_container_action surfaces CLI stderr",
+            ok is False
+            and (out.get("error") or {}).get("code") == "docker_cli_error"
+            and "cannot stop" in str(out),
+            str(out)[:300],
+        )
+        ok, out = asyncio.run(call({"container": "stub-container", "action": "remove"}))
+        check(
+            "ai: docker_container_action validates action",
+            ok is False and (out.get("error") or {}).get("code") == "invalid_action",
+            str(out)[:300],
+        )
+        ok, out = asyncio.run(call({"action": "start"}))
+        check(
+            "ai: docker_container_action validates container",
+            ok is False and (out.get("error") or {}).get("code") == "missing_container",
+            str(out)[:300],
+        )
+    finally:
+        os.environ["PATH"] = old_path
+        shutil.rmtree(stub_dir, ignore_errors=True)
+
+    client = FTPClient({"host": "127.0.0.1"})
+    client.home_path = "/home/hexftp"
+    blocked = []
+    for path in ("../escape.txt", "/etc/passwd", "sub/../../x"):
+        try:
+            client.safe_path(path)
+            blocked.append(path)
+        except FTPError:
+            pass
+    check(
+        "ai: ftp path guard blocks escapes",
+        not blocked and client.safe_path("/home/hexftp/ok.txt") == "/home/hexftp/ok.txt",
+        f"allowed={blocked}",
+    )
+
+
 def main() -> int:
     global BASE, TOKEN, ORIGINAL_AI
     parser = argparse.ArgumentParser()
@@ -208,6 +339,17 @@ def main() -> int:
     payload = f"AI SCP E2E {suffix}\nline2\n"
     with open(local_up, "w", encoding="utf-8") as fh:
         fh.write(payload)
+
+    os.makedirs("/tmp/h1khub-ftp", exist_ok=True)
+    ftp_upload_local = os.path.join(tempfile.gettempdir(), f"h1khub-ai-ftp-up-{suffix}.txt")
+    ftp_download_local = os.path.join(tempfile.gettempdir(), f"h1khub-ai-ftp-down-{suffix}.txt")
+    ftp_payload = f"AI FTP E2E {suffix}\nline2\n"
+    with open(ftp_upload_local, "w", encoding="utf-8") as fh:
+        fh.write(ftp_payload)
+    ftp_remote = f"/ai-upload-{suffix}.txt"
+    ftp_renamed = f"/ai-renamed-{suffix}.txt"
+    ftp_name_remote = ftp_remote.lstrip("/")
+    ftp_name_renamed = ftp_renamed.lstrip("/")
 
     try:
         print("[models]")
@@ -250,6 +392,120 @@ def main() -> int:
         ftp_result = (ftp["toolResults"] or [{}])[0]
         check("ai: ftp_list ok", ftp_result.get("ok") is True, str(ftp_result)[:300])
         check("ai: ftp_list sees hello.txt", "hello.txt" in (ftp_result.get("output") or ""), (ftp_result.get("output") or "")[:200])
+
+        print("\n[tool: ftp upload/download/rename/delete]")
+        rej_up = asyncio.run(
+            run_chat(
+                f'@tool ftp_upload {{"asset_id":"{ftp_id}","local_path":"{ftp_upload_local}","remote_path":"{ftp_remote}"}}',
+                approve=False,
+            )
+        )
+        rej_up_result = (rej_up["toolResults"] or [{}])[0]
+        check(
+            "ai: ftp_upload rejected",
+            rej_up_result.get("ok") is False and "拒绝" in (rej_up_result.get("output") or ""),
+            str(rej_up_result)[:300],
+        )
+        check("ai: ftp_upload rejection leaves no file", ftp_name_remote not in ftp_names(ftp_id))
+
+        up = asyncio.run(
+            run_chat(f'@tool ftp_upload {{"asset_id":"{ftp_id}","local_path":"{ftp_upload_local}","remote_path":"{ftp_remote}"}}')
+        )
+        up_result = (up["toolResults"] or [{}])[0]
+        check(
+            "ai: ftp_upload approved",
+            up_result.get("ok") is True and up["approvals"] == 1,
+            str(up_result)[:300],
+        )
+        check("ai: ftp_upload appears in listing", ftp_name_remote in ftp_names(ftp_id))
+
+        down = asyncio.run(
+            run_chat(
+                f'@tool ftp_download {{"asset_id":"{ftp_id}","remote_path":"{ftp_remote}","local_path":"{ftp_download_local}"}}'
+            )
+        )
+        down_result = (down["toolResults"] or [{}])[0]
+        check(
+            "ai: ftp_download approved",
+            down_result.get("ok") is True and down["approvals"] == 1,
+            str(down_result)[:300],
+        )
+        check(
+            "ai: ftp_download content",
+            os.path.isfile(ftp_download_local)
+            and open(ftp_download_local, encoding="utf-8").read() == ftp_payload,
+        )
+
+        moved = asyncio.run(
+            run_chat(
+                f'@tool ftp_rename {{"asset_id":"{ftp_id}","from_path":"{ftp_remote}","to_path":"{ftp_renamed}"}}'
+            )
+        )
+        moved_result = (moved["toolResults"] or [{}])[0]
+        check(
+            "ai: ftp_rename approved",
+            moved_result.get("ok") is True and moved["approvals"] == 1,
+            str(moved_result)[:300],
+        )
+        names_after_rename = ftp_names(ftp_id)
+        check(
+            "ai: ftp_rename moved file",
+            ftp_name_renamed in names_after_rename and ftp_name_remote not in names_after_rename,
+            str(names_after_rename)[:300],
+        )
+
+        rej_del = asyncio.run(
+            run_chat(f'@tool ftp_delete {{"asset_id":"{ftp_id}","path":"{ftp_renamed}"}}', approve=False)
+        )
+        rej_del_result = (rej_del["toolResults"] or [{}])[0]
+        check(
+            "ai: ftp_delete rejected",
+            rej_del_result.get("ok") is False and "拒绝" in (rej_del_result.get("output") or ""),
+            str(rej_del_result)[:300],
+        )
+        check("ai: ftp_delete rejection keeps file", ftp_name_renamed in ftp_names(ftp_id))
+
+        deleted = asyncio.run(run_chat(f'@tool ftp_delete {{"asset_id":"{ftp_id}","path":"{ftp_renamed}"}}'))
+        deleted_result = (deleted["toolResults"] or [{}])[0]
+        check(
+            "ai: ftp_delete approved",
+            deleted_result.get("ok") is True and deleted["approvals"] == 1,
+            str(deleted_result)[:300],
+        )
+        check("ai: ftp_delete removed file", ftp_name_renamed not in ftp_names(ftp_id))
+
+        bad_rename = asyncio.run(
+            run_chat(f'@tool ftp_rename {{"asset_id":"{ftp_id}","from_path":"{ftp_renamed}"}}')
+        )
+        bad_rename_result = (bad_rename["toolResults"] or [{}])[0]
+        check(
+            "ai: ftp_rename validates args",
+            bad_rename_result.get("ok") is False and bad_rename["approvals"] == 0,
+            str(bad_rename_result)[:300],
+        )
+
+        print("\n[tool: docker_container_action]")
+        docker_action_stub_tests()
+        rej_docker = asyncio.run(
+            run_chat('@tool docker_container_action {"action":"restart","container":"h1khub-ai-none"}', approve=False)
+        )
+        rej_docker_result = (rej_docker["toolResults"] or [{}])[0]
+        check(
+            "ai: docker_container_action rejected",
+            rej_docker_result.get("ok") is False and "拒绝" in (rej_docker_result.get("output") or ""),
+            str(rej_docker_result)[:300],
+        )
+        bad_docker = asyncio.run(
+            run_chat('@tool docker_container_action {"action":"remove","container":"h1khub-ai-none"}')
+        )
+        bad_docker_result = (bad_docker["toolResults"] or [{}])[0]
+        check(
+            "ai: docker_container_action validates before approval",
+            bad_docker_result.get("ok") is False
+            and bad_docker["approvals"] == 0
+            and "invalid_action" in (bad_docker_result.get("output") or ""),
+            str(bad_docker_result)[:300],
+        )
 
         print("\n[tool: scp upload/download]")
         up = asyncio.run(run_chat(f'@tool scp_upload {{"asset_id":"{ssh_id}","local_path":"{local_up}","remote_path":"{remote}"}}'))
@@ -294,10 +550,15 @@ def main() -> int:
         check("ai: list_tunnels ok", list_result.get("ok") is True, str(list_result)[:300])
     finally:
         batch_exec(ssh_id, f"rm -f {remote}")
-        for path in (local_up, local_down):
+        for path in (local_up, local_down, ftp_upload_local, ftp_download_local):
             try:
                 os.unlink(path)
             except OSError:
+                pass
+        for name in (ftp_remote, ftp_renamed):
+            try:
+                asyncio.run(run_chat(f'@tool ftp_delete {{"asset_id":"{ftp_id}","path":"{name}"}}'))
+            except Exception:
                 pass
         if ORIGINAL_AI is not None:
             providers = []

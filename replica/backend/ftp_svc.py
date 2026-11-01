@@ -152,6 +152,22 @@ class FTPClient:
             text = posixpath.join(self.home_path or "/", text)
         return posixpath.normpath(text)
 
+    def safe_path(self, path: str) -> str:
+        """Resolve a path for write operations and refuse escapes from the FTP root.
+
+        ``home_path`` is the directory the asset logged into, i.e. the configured
+        root. Absolute paths and ``..`` segments that climb above it are rejected
+        instead of being silently clamped, so a tool call cannot touch files the
+        user did not configure. The server root itself has nothing above it.
+        """
+        target = self._abs(path)
+        home = posixpath.normpath(self.home_path or "/")
+        if home == "/":
+            return target
+        if target == home or target.startswith(home.rstrip("/") + "/"):
+            return target
+        raise FTPError(f"路径越界：{path} 不在 FTP 主目录 {home} 内")
+
     # --------------------------------------------------------------------- read
     def test(self) -> dict:
         timer = time.time()

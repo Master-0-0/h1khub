@@ -2238,3 +2238,92 @@ SQL 2（对象清单/执行）、Docker 2（容器/日志）、终端 3（会话
 隧道 3（启动/停止/列表），其余 6 类各 1，与代码一致。
 
 回归：`python3 scripts/test_ai.py --base http://127.0.0.1:38110` → **PASS=24 FAIL=0**。
+
+---
+
+## 35. AI 工具面扩展：Docker 容器动作 + FTP 写操作（方向 C，2026-11-01）
+
+本轮在**不改动流式解析与审批框架**的前提下，按方向 C 增量扩展 AI 工具面：
+
+1. `docker_container_action`：`start` / `stop` / `restart`，复用 `docker_svc.DockerService.action`；
+2. `ftp_upload` / `ftp_download` / `ftp_delete` / `ftp_rename`：复用 `ftp_svc.FTPClient.upload_from /
+   download_to / delete / rename`，不重写协议层。
+
+工具总数 **20 → 25**（`len(TOOLS)` 为唯一依据）。
+
+### 35.1 代码变更
+
+| 文件 | 变更 |
+|---|---|
+| `backend/ai.py` | `TOOLS` 新增 5 个工具；`ChatRunner` 新增 5 个 `tool_*` handler；导入 `FTPError`；`DOCKER_ACTIONS` 常量；`_silent` 显式声明 `docker_action` / `ftp_write` 恒需审批；系统提示词补充 Docker 动作与 FTP 写能力 |
+| `backend/ftp_svc.py` | 新增 `FTPClient.safe_path()`：写操作前把路径解析到登录主目录内，绝对路径与 `..` 越界直接 `FTPError`，不静默截断 |
+| `scripts/test_ai.py` | 新增 FTP 写操作批准/拒绝/参数校验用例、Docker 动作 stub CLI 用例、FTP 越界单测、`TOOLS=25` 与 handler 集合一致性断言 |
+
+### 35.2 25 个工具与新增项
+
+原 20 个：`list_assets`、`list_dir`、`read_file`、`write_file`、`shell`、`list_db_objects`、
+`execute_sql`、`redis_command`、`docker_containers`、`docker_logs`、`list_sessions`、
+`read_terminal`、`terminal_execute`、`scp_upload`、`scp_download`、`list_tunnels`、
+`start_tunnel`、`stop_tunnel`、`ftp_list`、`web_fetch`。
+新增 5 个：`docker_container_action`、`ftp_upload`、`ftp_download`、`ftp_delete`、`ftp_rename`。
+
+`grep -c "async def tool_" backend/ai.py` = 25；工具名集合与 handler 集合 diff 为空
+（测试内也断言 `len(TOOLS) == 25 and set(names) == handlers`，防止文档/代码再次漂移）。
+
+### 35.3 审批与安全边界
+
+| 操作 | 审批 kind | 行为 |
+|---|---|---|
+| Docker `start` / `stop` / `restart` | `docker_action` | 恒需审批，不受 `allowSilent*` 影响；先校验 `action`/`container`，再审批，再查容器存在性 |
+| FTP 上传 / 下载 / 删除 / 重命名 | `ftp_write` | 恒需审批，不继承 `allowSilentFileWrite`；下载同样审批（远端读取 + 本机落盘） |
+
+- Docker 目标为 `asset_id` + `container`：按容器名或 ID（含前缀）匹配 `docker ps` 结果；
+  不存在返回结构化 `{"error": {"code": "container_not_found", ...}}`；
+  CLI stderr 转为 `{"code": "docker_cli_error", "message": <stderr>}`，不再以裸异常文本回模型。
+- FTP 写路径统一经过 `safe_path()`：`..`、`/etc/...`、`sub/../../x` 一律拒绝并返回
+  `FTPError: 路径越界...`；服务器根目录为 `/` 时没有更高层级，规则自然退化为根内全允许。
+- `TERMINAL_TOOL_NAMES`（13 个）与 `SQL_TOOL_NAMES`（5 个）**未纳入**新工具，保持既有子集边界；
+  终端助手仍不能调用 Docker/FTP 动作（既有 mode 限制测试继续通过）。
+
+### 35.4 测试与证据
+
+命令与日志：
+
+```
+cd replica
+python3 scripts/test_ai.py --base http://127.0.0.1:38110 2>&1 | tee /tmp/h1khub-test_ai.log
+# PASS=48 FAIL=0
+```
+
+覆盖（全部走 `scripts/mock_llm.py`，无外部模型）：
+
+- FTP：上传拒绝（且不落盘）/ 批准（列表可见）/ 下载批准且内容一致 / 重命名批准且旧名消失 /
+  删除拒绝仍保留 / 删除批准后消失 / 缺参在审批前失败；`safe_path` 越界单测。
+- Docker：拒绝路径（`approve=False`）；`action=remove` 与缺 `container` 在审批前失败；
+  批准路径用**进程内 stub `docker` CLI**（`PATH` 前置临时脚本，无真实守护进程）验证
+  `start` / `stop` / `restart` 成功、未知容器、CLI stderr 结构化错误。
+  未连接真实 Docker、未创建/停止任何真实容器。
+- 回归：既有流式对话、shell 审批、拒绝、SCP、隧道、SQL/Terminal 模式全部保持 PASS。
+
+### 35.5 文档计数同步（20 → 25）
+
+| 位置 | 现值 |
+|---|---|
+| `README.md:187`（目录树） | 25 个工具 |
+| `README.md:317`（AI Agent 能力表） | 25 个（枚举同步补 Docker 启停、FTP 上传/下载/删除/重命名） |
+| `README.md:397`（审批说明） | 补 Docker 动作与 FTP 写操作恒需审批 |
+| `docs/feature-matrix.csv:72` | 25 个工具；新增 Docker 启停、FTP 写两行 |
+| `docs/completion-audit.csv:77` | AI 工具 25 个 |
+
+核对命令：
+
+```
+python3 -c "import sys;sys.path.insert(0,'backend');import ai;print(len(ai.TOOLS))"   # → 25
+grep -c "async def tool_" backend/ai.py                                              # → 25
+```
+
+### 35.6 边界与未做
+
+- 未实现资产 CRUD（方向 D）、`websearch`（方向 B）、VNC/RDP 后端、会话/PTY 新建；这些仍在待办池。
+- `docker_container_action` 仅开放 start/stop/restart，不开放 `kill` / `pause` / `remove`，避免误删。
+- FTP 写工具复用现有 FTP 资产配置；SFTP 资产仍走 `scp_*` / 文件面板。

@@ -69,7 +69,9 @@ Docker,本地 OCI registry 发布/拉取,已实现,tools/oci_registry.py（/v2�
 AI,OpenAI 兼容 + Anthropic,已实现,ai.py,AiChat,
 AI,流式对话,已实现,ai.py,AiChat,
 AI,供应商预设 13 家,已实现,ai.py provider_urls,SettingsDialog,13 家 + 自定义；真实 Key 未接入
-AI,工具调用,已实现,ai.py tools,AiChat,20 个工具（含 SCP/隧道/FTP）
+AI,工具调用,已实现,ai.py tools,AiChat,25 个工具（含 SCP/隧道/FTP 全操作/Docker 容器启停；FTP 写与 Docker 动作用独立审批 kind）
+AI,工具-Docker 容器启停,已实现,ai.py docker_container_action,AiChat,start/stop/restart；容器存在性校验 + CLI stderr 结构化错误；stub CLI 无守护进程实测
+AI,工具-FTP 写操作,已实现,ai.py ftp_upload/download/delete/rename,AiChat,上传/下载/删除/重命名；主目录越界校验；本地 FTP 桩实测
 AI,审批策略,已实现,ai.py / settings,AiChat,可本会话记住
 AI,会话持久化,已实现,store.py chat_*,AiChat,
 AI,模型列表/连通性测试,已实现,app.py /api/ai/*,SettingsDialog,

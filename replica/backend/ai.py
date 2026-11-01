@@ -13,6 +13,7 @@ import aiohttp
 
 from db import DatabaseError
 from docker_svc import DockerError
+from ftp_svc import FTPError
 from redis_svc import RedisError
 import agent_backup
 from util import b64decode_str, clamp_text, human_bytes, jsonable, new_id, strip_ansi
@@ -25,7 +26,8 @@ SYSTEM_PROMPT = """你是 H1KHub（数据库 / SSH / SFTP / Docker 一体化桌�
 - 列出资产、浏览目录、读写文件（本机或远程 SFTP）
 - 执行 shell 命令（本机或 SSH 远程）
 - 查询数据库（MySQL / PostgreSQL / SQLite）、执行 SQL
-- 执行 Redis 命令、查看 Docker 容器与日志
+- 执行 Redis 命令、查看 Docker 容器与日志、启动/停止/重启 Docker 容器
+- 浏览 FTP 目录，上传/下载/删除/重命名 FTP 文件
 - 读取当前打开终端的内容
 
 行为准则：
@@ -141,6 +143,16 @@ TOOLS: list[dict] = [
         ["container"],
     ),
     _tool(
+        "docker_container_action",
+        "启动 / 停止 / 重启 Docker 容器（需要用户审批）。asset_id 为空时使用本机 Docker。",
+        {
+            "asset_id": {"type": "string", "description": "Docker 资产 ID，留空表示本机"},
+            "container": {"type": "string", "description": "容器名称或 ID（需已存在）"},
+            "action": {"type": "string", "enum": ["start", "stop", "restart"], "description": "容器动作"},
+        },
+        ["container", "action"],
+    ),
+    _tool(
         "list_sessions",
         "列出当前打开的终端会话（本地/SSH/Telnet/Docker）。",
     ),
@@ -199,6 +211,45 @@ TOOLS: list[dict] = [
         ["asset_id"],
     ),
     _tool(
+        "ftp_upload",
+        "把本机文件上传到 FTP 资产（需要审批）；远端路径必须位于该 FTP 主目录内。",
+        {
+            "asset_id": {"type": "string", "description": "FTP 资产 ID"},
+            "local_path": {"type": "string", "description": "本机文件路径"},
+            "remote_path": {"type": "string", "description": "远端目标文件路径"},
+        },
+        ["asset_id", "local_path", "remote_path"],
+    ),
+    _tool(
+        "ftp_download",
+        "从 FTP 资产下载文件到本机（需要审批）；远端路径必须位于该 FTP 主目录内。",
+        {
+            "asset_id": {"type": "string", "description": "FTP 资产 ID"},
+            "remote_path": {"type": "string", "description": "远端文件路径"},
+            "local_path": {"type": "string", "description": "本机保存路径"},
+        },
+        ["asset_id", "remote_path", "local_path"],
+    ),
+    _tool(
+        "ftp_delete",
+        "删除 FTP 资产上的文件或目录（需要审批）；路径必须位于该 FTP 主目录内。",
+        {
+            "asset_id": {"type": "string", "description": "FTP 资产 ID"},
+            "path": {"type": "string", "description": "要删除的远端路径"},
+        },
+        ["asset_id", "path"],
+    ),
+    _tool(
+        "ftp_rename",
+        "重命名/移动 FTP 资产上的文件或目录（需要审批）；源与目标都必须位于该 FTP 主目录内。",
+        {
+            "asset_id": {"type": "string", "description": "FTP 资产 ID"},
+            "from_path": {"type": "string", "description": "原路径"},
+            "to_path": {"type": "string", "description": "新路径"},
+        },
+        ["asset_id", "from_path", "to_path"],
+    ),
+    _tool(
         "web_fetch",
         "抓取一个 http(s) 页面并转为纯文本（最多 200KB）。",
         {"url": {"type": "string"}},
@@ -248,6 +299,7 @@ DANGEROUS_TOKENS = re.compile(
 WRAPPER_TOKENS = re.compile(r"(^|[\s;&|()])(sudo|doas|exec|nohup|setsid|env)(\s|$)")
 
 SQL_READ = re.compile(r"^\s*(select|show|describe|desc|explain|with|pragma|values)\b", re.I)
+DOCKER_ACTIONS = ("start", "stop", "restart")
 REDIS_READ_COMMANDS = {
     "get", "mget", "strlen", "ttl", "pttl", "type", "exists", "keys", "scan", "dbsize",
     "hget", "hgetall", "hkeys", "hvals", "hlen", "hexists", "hmget",
@@ -699,6 +751,10 @@ class ChatRunner:
             return False
         if kind == "redis_write":
             return False
+        if kind == "docker_action":
+            return False
+        if kind == "ftp_write":
+            return False
         return False
 
     async def _require(self, kind: str, title: str, detail: dict) -> bool:
@@ -712,7 +768,7 @@ class ChatRunner:
             return False, f"未知工具：{name}"
         try:
             return await handler(args or {})
-        except (DatabaseError, RedisError, DockerError, ValueError, OSError) as exc:
+        except (DatabaseError, RedisError, DockerError, FTPError, ValueError, OSError) as exc:
             return False, f"{type(exc).__name__}: {exc}"
         except Exception as exc:  # defensive: never crash the agent loop
             return False, f"工具执行异常：{type(exc).__name__}: {exc}"
@@ -925,6 +981,78 @@ class ChatRunner:
             if transport:
                 transport.close()
 
+    async def tool_docker_container_action(self, args: dict):
+        action = str(args.get("action") or "").strip().lower()
+        container = str(args.get("container") or "").strip()
+        if action not in DOCKER_ACTIONS:
+            return False, {
+                "error": {
+                    "code": "invalid_action",
+                    "action": action,
+                    "message": f"action 必须是 {' / '.join(DOCKER_ACTIONS)} 之一",
+                }
+            }
+        if not container:
+            return False, {"error": {"code": "missing_container", "message": "缺少 container"}}
+        if not await self._require(
+            "docker_action",
+            f"Docker 容器操作：{action} {container}",
+            {
+                "asset_id": args.get("asset_id"),
+                "container": container,
+                "action": action,
+                "target": "remote" if args.get("asset_id") else "local",
+            },
+        ):
+            return False, "用户拒绝执行 Docker 容器操作"
+        transport = None
+        try:
+            service, transport = await self.hub.docker(args.get("asset_id"))
+            containers = await asyncio.to_thread(service.containers)
+            wanted = container.lower()
+            match = None
+            for item in containers:
+                cid = str(item.get("id") or "").lower()
+                name = str(item.get("name") or "")
+                if container == name or (cid and (wanted == cid or cid.startswith(wanted))):
+                    match = item
+                    break
+            if match is None:
+                return False, {
+                    "error": {
+                        "code": "container_not_found",
+                        "container": container,
+                        "message": f"容器不存在：{container}（先用 docker_containers 确认名称或 ID）",
+                    }
+                }
+            name = str(match.get("name") or container)
+            try:
+                result = await asyncio.to_thread(service.action, name, action)
+            except DockerError as exc:
+                return False, {
+                    "error": {
+                        "code": "docker_cli_error",
+                        "action": action,
+                        "container": name,
+                        "message": str(exc),
+                    }
+                }
+            return True, {
+                "ok": True,
+                "action": action,
+                "container": name,
+                "id": match.get("id"),
+                "previousState": match.get("state"),
+                "result": result,
+            }
+        except DockerError as exc:
+            return False, {
+                "error": {"code": "docker_error", "action": action, "container": container, "message": str(exc)}
+            }
+        finally:
+            if transport:
+                transport.close()
+
     async def tool_list_sessions(self, args: dict):
         return True, self.hub.sessions.list()
 
@@ -1036,6 +1164,95 @@ class ChatRunner:
             "count": len(data["entries"]),
             "protocol": data.get("protocol"),
         }
+
+    async def tool_ftp_upload(self, args: dict):
+        asset_id = args.get("asset_id")
+        local_path = os.path.expanduser(str(args.get("local_path") or ""))
+        remote_path = str(args.get("remote_path") or "").strip()
+        if not asset_id or not local_path or not remote_path:
+            return False, "缺少 asset_id / local_path / remote_path"
+        if "\x00" in local_path or "\x00" in remote_path:
+            return False, "路径包含非法字符"
+        if not os.path.isfile(local_path):
+            return False, f"本机文件不存在：{local_path}"
+        size = os.path.getsize(local_path)
+        if not await self._require(
+            "ftp_write",
+            f"FTP 上传 {local_path} → {remote_path}",
+            {"asset_id": asset_id, "local_path": local_path, "remote_path": remote_path, "bytes": size},
+        ):
+            return False, "用户拒绝 FTP 上传"
+        client = await self.hub.open_ftp(asset_id)
+        try:
+            target = client.safe_path(remote_path)
+            uploaded = await asyncio.to_thread(client.upload_from, local_path, target)
+        finally:
+            await asyncio.to_thread(client.close)
+        return True, {"ok": True, "path": target, "size": uploaded}
+
+    async def tool_ftp_download(self, args: dict):
+        asset_id = args.get("asset_id")
+        remote_path = str(args.get("remote_path") or "").strip()
+        local_path = os.path.expanduser(str(args.get("local_path") or ""))
+        if not asset_id or not remote_path or not local_path:
+            return False, "缺少 asset_id / remote_path / local_path"
+        if "\x00" in remote_path or "\x00" in local_path:
+            return False, "路径包含非法字符"
+        if not await self._require(
+            "ftp_write",
+            f"FTP 下载 {remote_path} → {local_path}",
+            {"asset_id": asset_id, "remote_path": remote_path, "local_path": local_path},
+        ):
+            return False, "用户拒绝 FTP 下载"
+        client = await self.hub.open_ftp(asset_id)
+        try:
+            target = client.safe_path(remote_path)
+            size = await asyncio.to_thread(client.download_to, target, local_path)
+        finally:
+            await asyncio.to_thread(client.close)
+        return True, {"ok": True, "path": target, "localPath": local_path, "size": size}
+
+    async def tool_ftp_delete(self, args: dict):
+        asset_id = args.get("asset_id")
+        path = str(args.get("path") or "").strip()
+        if not asset_id or not path:
+            return False, "缺少 asset_id / path"
+        if "\x00" in path:
+            return False, "路径包含非法字符"
+        if not await self._require(
+            "ftp_write", f"FTP 删除 {path}", {"asset_id": asset_id, "path": path}
+        ):
+            return False, "用户拒绝 FTP 删除"
+        client = await self.hub.open_ftp(asset_id)
+        try:
+            target = client.safe_path(path)
+            await asyncio.to_thread(client.delete, target)
+        finally:
+            await asyncio.to_thread(client.close)
+        return True, {"ok": True, "deleted": target}
+
+    async def tool_ftp_rename(self, args: dict):
+        asset_id = args.get("asset_id")
+        src = str(args.get("from_path") or "").strip()
+        dst = str(args.get("to_path") or "").strip()
+        if not asset_id or not src or not dst:
+            return False, "缺少 asset_id / from_path / to_path"
+        if "\x00" in src or "\x00" in dst:
+            return False, "路径包含非法字符"
+        if not await self._require(
+            "ftp_write",
+            f"FTP 重命名 {src} → {dst}",
+            {"asset_id": asset_id, "from_path": src, "to_path": dst},
+        ):
+            return False, "用户拒绝 FTP 重命名"
+        client = await self.hub.open_ftp(asset_id)
+        try:
+            src_abs = client.safe_path(src)
+            dst_abs = client.safe_path(dst)
+            await asyncio.to_thread(client.rename, src_abs, dst_abs)
+        finally:
+            await asyncio.to_thread(client.close)
+        return True, {"ok": True, "from": src_abs, "to": dst_abs}
 
     async def tool_web_fetch(self, args: dict):
         url = (args.get("url") or "").strip()
